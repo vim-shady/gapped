@@ -1,0 +1,43 @@
+use std::fmt;
+use anyhow::{bail, Result};
+use std::path::{Component, Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RelativePath(PathBuf);
+
+impl RelativePath {
+    /// Create a RelativePath from full path by stripping root prefix
+    pub fn from_full_path(full_path: &Path, root: &Path) -> Result<Self> {
+        let relative_path = full_path.strip_prefix(root)?;
+        Self::new(relative_path)
+    }
+
+    /// Create a normalized RelativePath from an already relative path
+    pub fn new(path: &Path) -> Result<Self> {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(c) => normalized.push(c),
+                Component::CurDir => {} // skip ".",
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => bail!("Invalid path: {}", path.display()),
+            }
+        }
+        Ok(RelativePath(normalized))
+    }
+
+    pub fn root() -> Self {
+        RelativePath(PathBuf::new())
+    }
+}
+
+impl AsRef<Path> for RelativePath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl fmt::Display for RelativePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}

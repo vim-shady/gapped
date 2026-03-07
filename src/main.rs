@@ -1,4 +1,6 @@
 mod cli;
+mod model;
+mod fs;
 
 use clap::Parser;
 
