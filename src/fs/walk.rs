@@ -95,10 +95,10 @@ pub fn walk_filesystem(root: &Path) -> Result<(Vec<Entry>, WalkStats)> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
-    use super::*;
 
     fn setup_test_tree() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -137,10 +137,7 @@ mod tests {
         let tmp = setup_test_tree();
         let (entries, _) = walk_filesystem(tmp.path()).unwrap();
 
-        let paths: Vec<String> = entries
-            .iter()
-            .map(|e| e.path.to_string())
-            .collect();
+        let paths: Vec<String> = entries.iter().map(|e| e.path.to_string()).collect();
 
         let mut sorted = paths.clone();
         sorted.sort();

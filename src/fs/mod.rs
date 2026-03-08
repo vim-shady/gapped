@@ -1,2 +1,2 @@
-mod walk;
+pub mod walk;
 mod metadata;

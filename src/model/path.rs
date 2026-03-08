@@ -1,8 +1,9 @@
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use anyhow::{bail, Result};
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RelativePath(PathBuf);
 
 impl RelativePath {
@@ -19,7 +20,9 @@ impl RelativePath {
             match component {
                 Component::Normal(c) => normalized.push(c),
                 Component::CurDir => {} // skip ".",
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => bail!("Invalid path: {}", path.display()),
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    bail!("Invalid path: {}", path.display())
+                }
             }
         }
         Ok(RelativePath(normalized))
