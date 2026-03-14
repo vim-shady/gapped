@@ -31,6 +31,11 @@ impl RelativePath {
     pub fn root() -> Self {
         RelativePath(PathBuf::new())
     }
+
+    /// Convert to full path by joining with root
+    pub fn to_full_path(&self, root: &Path) -> PathBuf {
+        root.join(&self.0)
+    }
 }
 
 impl AsRef<Path> for RelativePath {

@@ -2,14 +2,16 @@ use super::path::RelativePath;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Serialize, Deserialize)]
+/// Kind of filesystem entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryKind {
     File,
     Directory,
     Symlink,
 }
 
-#[derive(Serialize, Deserialize)]
+/// Metadata for a filesystem entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
     pub size: u64,
     pub mtime_sec: i64, // negative values are actually used for timestamps that date before 1970 :)
@@ -24,11 +26,12 @@ impl Metadata {
     }
 }
 
+/// A single filesystem entry.
 #[derive(Serialize, Deserialize)]
 pub struct Entry {
     pub path: RelativePath,
     pub kind: EntryKind,
     pub metadata: Metadata,
-    pub hash: Option<String>,
+    pub hash: Option<[u8; 32]>,
     pub symlink_target: Option<PathBuf>,
 }

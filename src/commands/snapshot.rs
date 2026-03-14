@@ -6,6 +6,7 @@ use crate::model::entry::Entry;
 use crate::model::path::RelativePath;
 use crate::model::snapshot::Snapshot;
 use anyhow::Result;
+use log::info;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
@@ -29,6 +30,7 @@ pub fn load_snapshot_entries(
     Ok((entries, header))
 }
 
+/// Load a snapshot from a file (should already be sorted by path)
 pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
     let file = File::open(snapshot_path)?;
     let reader = std::io::BufReader::new(file);
@@ -60,15 +62,19 @@ pub fn run_snapshot(
 
     // Load previous snapshot if provided
     let previous_entries = if let Some(snapshot_in) = snapshot_in {
+        info!("Loading previous snapshot from {}", snapshot_in.display());
         let (entries, _header) = load_snapshot_entries(snapshot_in)?;
+        info!("Loaded {} entries from previous snapshot", entries.len());
         Some(entries)
     } else {
         None
     };
 
     // Walk the file system
-    let (entries, stats) = walk_filesystem(&root_dir /*, previous_entries*/)?;
+    info!("Walking filesystem under {}", root_dir.display());
+    let (entries, stats) = walk_filesystem(&root_dir, previous_entries.as_ref())?;
 
+    info!("Writing snapshot to {}", snapshot_out.display());
     let file = File::create(snapshot_out)?;
     let buf_writer = BufWriter::new(file);
 
@@ -83,7 +89,7 @@ pub fn run_snapshot(
     };
 
     let mut writer = if compress {
-        todo!()
+        todo!() // Todo: implement compression
     } else {
         JsonFormatWriter::new(buf_writer, &header)?
     };
