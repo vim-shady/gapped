@@ -109,3 +109,8 @@ pub fn run_snapshot(
 
     Ok(())
 }
+
+pub fn hash_snapshot_file(snapshot_path: &Path) -> Result<[u8; 32]> {
+    crate::fs::hash::hash_file(snapshot_path)
+        .map_err(|e| anyhow::anyhow!("Failed to hash snapshot file: {}", e))
+}

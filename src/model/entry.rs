@@ -27,7 +27,7 @@ impl Metadata {
 }
 
 /// A single filesystem entry.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub path: RelativePath,
     pub kind: EntryKind,
