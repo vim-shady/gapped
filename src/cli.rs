@@ -37,6 +37,9 @@ pub enum Commands {
         /// Input snapshot file (previous state)
         snapshot_in: PathBuf,
 
+        /// Output diff file
+        diff_out: PathBuf,
+
         /// Output snapshot file (current state)
         snapshot_out: PathBuf,
 

@@ -1,2 +1,2 @@
 pub mod snapshot;
-mod diff;
+pub mod diff;

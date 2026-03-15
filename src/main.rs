@@ -6,6 +6,7 @@ mod model;
 
 use clap::Parser;
 
+use crate::commands::diff::run_diff;
 use crate::commands::snapshot::run_snapshot;
 use cli::{Cli, Commands};
 
@@ -20,7 +21,21 @@ fn main() {
             compress,
         } => run_snapshot(&root_dir, &snapshot_out, snapshot_in.as_deref(), compress),
 
-        Commands::Diff { .. } => unimplemented!(),
+        Commands::Diff {
+            root_dir,
+            snapshot_in,
+            diff_out,
+            snapshot_out,
+            split_size,
+            compress,
+        } => run_diff(
+            &root_dir,
+            &snapshot_in,
+            &diff_out,
+            &snapshot_out,
+            split_size,
+            compress,
+        ),
         Commands::Apply { .. } => unimplemented!(),
         Commands::Verify { .. } => unimplemented!(),
     };

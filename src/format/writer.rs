@@ -1,4 +1,5 @@
 use crate::format::header::FileHeader;
+use crate::model::diff::Change;
 use crate::model::entry::Entry;
 use anyhow::Result;
 use serde::Serialize;
@@ -6,6 +7,17 @@ use std::io::Write;
 
 pub trait FormatWriter<W: Write> {
     fn write_snapshot_entry(&mut self, entry: &Entry) -> Result<()>;
+
+    fn write_diff_change(&mut self, change: &crate::model::diff::Change) -> Result<()>;
+
+    /// Write raw file content from a reader, streaming it
+    fn write_file_content_from_reader(
+        &mut self,
+        reader: &mut dyn std::io::Read,
+        size: u64,
+    ) -> Result<()>;
+
+    fn write_file_content(&mut self, content: &[u8]) -> Result<()>;
 }
 
 pub struct JsonFormatWriter<W: Write> {
@@ -42,6 +54,29 @@ impl<W: Write> JsonFormatWriter<W> {
 impl<W: Write> FormatWriter<W> for JsonFormatWriter<W> {
     fn write_snapshot_entry(&mut self, entry: &Entry) -> Result<()> {
         self.bytes_written += Self::write_line(&mut self.inner, &JsonRecord::SnapshotEntry(entry))?;
+        Ok(())
+    }
+
+    fn write_diff_change(&mut self, change: &Change) -> Result<()> {
+        let payload = serde_json::to_vec(change)?;
+        self.inner.write_all(&payload)?;
+        Ok(())
+    }
+
+    fn write_file_content_from_reader(
+        &mut self,
+        reader: &mut dyn std::io::Read,
+        size: u64,
+    ) -> Result<()> {
+        let total_len = size as u32;
+        let len_bytes = total_len.to_le_bytes();
+        self.inner.write_all(&len_bytes)?;
+        std::io::copy(reader, &mut self.inner)?;
+        Ok(())
+    }
+
+    fn write_file_content(&mut self, content: &[u8]) -> Result<()> {
+        self.inner.write_all(content)?;
         Ok(())
     }
 }

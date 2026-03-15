@@ -85,6 +85,7 @@ pub fn run_snapshot(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64,
+        source_snapshot_hash: None,
         root_dir: Some(root_dir.to_string_lossy().to_string()),
     };
 

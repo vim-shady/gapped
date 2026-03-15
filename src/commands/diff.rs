@@ -1,9 +1,14 @@
 use crate::commands::snapshot::hash_snapshot_file;
-use crate::model::diff::{AddedEntry, Change, ChangeKind, ModifiedEntry};
+use crate::format::header::FileHeader;
+use crate::format::writer::{FormatWriter, JsonFormatWriter};
+use crate::model::diff::{AddedEntry, Change, ChangeKind, Diff, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
+use crate::model::snapshot::Snapshot;
 use anyhow::Result;
 use log::info;
 use std::cmp::Ordering;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
 pub fn run_diff(
@@ -93,8 +98,38 @@ pub fn run_diff(
     Ok(())
 }
 
-fn write_snapshot(p0: &Path, p1: &Vec<Entry>, p2: &PathBuf, p3: bool) -> Result<()> {
-    todo!()
+/// Write snapshot to file
+fn write_snapshot(
+    snapshot_out: &Path,
+    entries: &[Entry],
+    root_dir: &Path,
+    compress: bool,
+) -> Result<()> {
+    let file = File::create(snapshot_out)?;
+    let buf_writer = BufWriter::new(file);
+
+    let header = FileHeader {
+        file_type: "snapshot".to_string(),
+        version: Snapshot::CURRENT_VERSION,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        source_snapshot_hash: None,
+        root_dir: Some(root_dir.to_string_lossy().into_owned()),
+    };
+
+    let mut writer: JsonFormatWriter<BufWriter<File>> = if compress {
+        todo!()
+    } else {
+        JsonFormatWriter::new(buf_writer, &header)?
+    };
+
+    for entry in entries {
+        writer.write_snapshot_entry(entry)?;
+    }
+
+    Ok(())
 }
 
 fn write_split_diff(
@@ -109,13 +144,84 @@ fn write_split_diff(
 }
 
 fn write_single_diff(
-    p0: &Path,
-    p1: &Vec<Change>,
-    p2: [u8; 32],
-    p3: &PathBuf,
-    p4: bool,
+    diff_out: &Path,
+    changes: &[Change],
+    source_snapshot_hash: [u8; 32],
+    root_dir: &Path,
+    compress: bool,
 ) -> Result<()> {
-    todo!()
+    let file = File::create(diff_out)?;
+    let buf_writer = BufWriter::new(file);
+
+    let header = FileHeader {
+        file_type: "diff".to_string(),
+        version: Diff::CURRENT_VERSION,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        source_snapshot_hash: Some(source_snapshot_hash),
+        root_dir: None,
+    };
+
+    let mut writer = if compress {
+        todo!()
+    } else {
+        JsonFormatWriter::new(buf_writer, &header)?
+    };
+
+    write_changes(&mut writer, changes, root_dir)?;
+
+    Ok(())
+}
+
+// TODO: refactor this mess
+/// Write changes to a format writer, incl. file content
+fn write_changes<W: std::io::Write>(
+    writer: &mut dyn FormatWriter<W>,
+    changes: &[Change],
+    root_dir: &Path,
+) -> Result<()> {
+    for change in changes {
+        writer.write_diff_change(change)?;
+
+        match &change.kind {
+            ChangeKind::Added(added) if added.has_content => {
+                let full_path = change.path.to_full_path(root_dir);
+                match File::open(&full_path) {
+                    Ok(file) => {
+                        let meta_data = file.metadata()?;
+                        let size = meta_data.len();
+                        let mut reader = BufReader::new(file);
+                        writer.write_file_content_from_reader(&mut reader, size)?;
+                    }
+                    Err(e) => {
+                        log::warn!("Cannot read file {}: {}", full_path.display(), e);
+                        // Write empty file content
+                        writer.write_file_content(&[])?;
+                    }
+                }
+            }
+            ChangeKind::Modified(modified) if modified.has_content => {
+                let full_path = change.path.to_full_path(root_dir);
+                match File::open(&full_path) {
+                    Ok(file) => {
+                        let meta_data = file.metadata()?;
+                        let size = meta_data.len();
+                        let mut reader = BufReader::new(file);
+                        writer.write_file_content_from_reader(&mut reader, size)?;
+                    }
+                    Err(e) => {
+                        log::warn!("Cannot read file {}: {}", full_path.display(), e);
+                        writer.write_file_content(&[])?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn compute_diff(

@@ -1,7 +1,7 @@
 use crate::model::entry::Entry;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u32,
     pub created_at: i64,
