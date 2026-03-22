@@ -324,3 +324,239 @@ fn set_symlink_ownership(path: &Path, metadata: &Metadata) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::diff::{AddedEntry, ModifiedEntry};
+    use crate::model::entry::Entry;
+    use crate::model::path::RelativePath;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use std::io::Write as _;
+    use tempfile::TempDir;
+
+    fn make_metadata(size: u64, perms: u32) -> Metadata {
+        Metadata {
+            size,
+            mtime_sec: 1000,
+            mtime_nsec: 0,
+            permissions: perms,
+            uid: unsafe { nix::libc::getuid() },
+            gid: unsafe { nix::libc::getgid() },
+        }
+    }
+
+    fn diff_change_json(change: &Change) -> String {
+        format!(
+            r#"{{"type":"diff_change","change":{}}}"#,
+            serde_json::to_string(change).unwrap()
+        )
+    }
+
+    fn file_content_json(data: &[u8]) -> String {
+        format!(
+            r#"{{"type":"file_content","data":"{}"}}"#,
+            BASE64.encode(data)
+        )
+    }
+
+    /// Build a JSON-line diff file from a list of record lines.
+    fn build_diff_file(dir: &Path, records: &[String]) -> PathBuf {
+        let diff_path = dir.join("test.diff");
+        let mut file = File::create(&diff_path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"header","file_type":"diff","version":1,"created_at":0,"source_snapshot_hash":null,"root_dir":null}}"#
+        )
+        .unwrap();
+        for record in records {
+            writeln!(file, "{}", record).unwrap();
+        }
+        diff_path
+    }
+
+    // --- write_file_atomic ---
+
+    #[test]
+    fn write_file_atomic_creates_new_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("new.txt");
+        write_file_atomic(&path, b"hello").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn write_file_atomic_overwrites_existing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("existing.txt");
+        fs::write(&path, b"old").unwrap();
+        write_file_atomic(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    // --- run_apply: add / delete / modify ---
+
+    #[test]
+    fn apply_adds_file() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+
+        let change = Change {
+            path: RelativePath::new(Path::new("hello.txt")).unwrap(),
+            kind: ChangeKind::Added(AddedEntry {
+                entry: Entry {
+                    path: RelativePath::new(Path::new("hello.txt")).unwrap(),
+                    kind: EntryKind::File,
+                    metadata: make_metadata(5, 0o644),
+                    hash: None,
+                    symlink_target: None,
+                },
+                has_content: true,
+            }),
+        };
+
+        let diff_path = build_diff_file(
+            dir.path(),
+            &[diff_change_json(&change), file_content_json(b"hello")],
+        );
+        run_apply(&root, &diff_path).unwrap();
+
+        assert_eq!(fs::read(root.join("hello.txt")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn apply_deletes_file() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("bye.txt"), b"bye").unwrap();
+
+        let change = Change {
+            path: RelativePath::new(Path::new("bye.txt")).unwrap(),
+            kind: ChangeKind::Removed(EntryKind::File),
+        };
+
+        let diff_path = build_diff_file(dir.path(), &[diff_change_json(&change)]);
+        run_apply(&root, &diff_path).unwrap();
+
+        assert!(!root.join("bye.txt").exists());
+    }
+
+    #[test]
+    fn apply_modifies_file_content() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("data.txt"), b"old").unwrap();
+
+        let change = Change {
+            path: RelativePath::new(Path::new("data.txt")).unwrap(),
+            kind: ChangeKind::Modified(ModifiedEntry {
+                new_metadata: Some(make_metadata(3, 0o644)),
+                new_hash: None,
+                has_content: true,
+                new_symlink_target: None,
+            }),
+        };
+
+        let diff_path = build_diff_file(
+            dir.path(),
+            &[diff_change_json(&change), file_content_json(b"new")],
+        );
+        run_apply(&root, &diff_path).unwrap();
+
+        assert_eq!(fs::read(root.join("data.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn apply_adds_directory() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+
+        let change = Change {
+            path: RelativePath::new(Path::new("subdir")).unwrap(),
+            kind: ChangeKind::Added(AddedEntry {
+                entry: Entry {
+                    path: RelativePath::new(Path::new("subdir")).unwrap(),
+                    kind: EntryKind::Directory,
+                    metadata: make_metadata(0, 0o755),
+                    hash: None,
+                    symlink_target: None,
+                },
+                has_content: false,
+            }),
+        };
+
+        let diff_path = build_diff_file(dir.path(), &[diff_change_json(&change)]);
+        run_apply(&root, &diff_path).unwrap();
+
+        assert!(root.join("subdir").is_dir());
+    }
+
+    #[test]
+    fn apply_deletes_nested_directory() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/file.txt"), b"x").unwrap();
+
+        let records = vec![
+            diff_change_json(&Change {
+                path: RelativePath::new(Path::new("a/b/file.txt")).unwrap(),
+                kind: ChangeKind::Removed(EntryKind::File),
+            }),
+            diff_change_json(&Change {
+                path: RelativePath::new(Path::new("a/b")).unwrap(),
+                kind: ChangeKind::Removed(EntryKind::Directory),
+            }),
+            diff_change_json(&Change {
+                path: RelativePath::new(Path::new("a")).unwrap(),
+                kind: ChangeKind::Removed(EntryKind::Directory),
+            }),
+        ];
+
+        let diff_path = build_diff_file(dir.path(), &records);
+        run_apply(&root, &diff_path).unwrap();
+
+        assert!(!root.join("a").exists());
+    }
+
+    // --- Phase ordering ---
+
+    #[test]
+    fn deletions_sorted_deepest_first() {
+        let changes: Vec<(Change, Option<Vec<u8>>)> = vec![
+            (
+                Change {
+                    path: RelativePath::new(Path::new("a")).unwrap(),
+                    kind: ChangeKind::Removed(EntryKind::Directory),
+                },
+                None,
+            ),
+            (
+                Change {
+                    path: RelativePath::new(Path::new("a/b/c")).unwrap(),
+                    kind: ChangeKind::Removed(EntryKind::File),
+                },
+                None,
+            ),
+            (
+                Change {
+                    path: RelativePath::new(Path::new("a/b")).unwrap(),
+                    kind: ChangeKind::Removed(EntryKind::Directory),
+                },
+                None,
+            ),
+        ];
+
+        let mut deletions: Vec<&(Change, Option<Vec<u8>>)> = changes.iter().collect();
+        deletions.sort_by(|a, b| b.0.path.depth().cmp(&a.0.path.depth()));
+
+        assert_eq!(deletions[0].0.path.depth(), 3); // a/b/c
+        assert_eq!(deletions[1].0.path.depth(), 2); // a/b
+        assert_eq!(deletions[2].0.path.depth(), 1); // a
+    }
+}
