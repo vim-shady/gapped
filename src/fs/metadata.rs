@@ -9,6 +9,7 @@ pub fn collect_metadata(path: &Path) -> std::io::Result<(Metadata, std::fs::File
     let metadata = Metadata {
         size: if file_type.is_file() { meta.len() } else { 0 },
         mtime_sec: meta.mtime(),
+        mtime_nsec: meta.mtime_nsec() as u32,
         permissions: meta.mode() & 0o777, // only permission bits
         uid: meta.uid(),
         gid: meta.gid(),

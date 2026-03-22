@@ -6,6 +6,7 @@ mod model;
 
 use clap::Parser;
 
+use crate::commands::apply::run_apply;
 use crate::commands::diff::run_diff;
 use crate::commands::snapshot::run_snapshot;
 use cli::{Cli, Commands};
@@ -36,7 +37,7 @@ fn main() {
             split_size,
             compress,
         ),
-        Commands::Apply { .. } => unimplemented!(),
+        Commands::Apply { root_dir, diff_in } => run_apply(&root_dir, &diff_in),
         Commands::Verify { .. } => unimplemented!(),
     };
 }

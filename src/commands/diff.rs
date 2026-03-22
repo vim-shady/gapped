@@ -325,7 +325,6 @@ fn build_added_change(entry: &Entry) -> Change {
 mod tests {
     use super::*;
     use crate::model::entry::{Entry, EntryKind, Metadata};
-    use crate::model::snapshot::Snapshot;
     use std::path::PathBuf;
     use crate::model::path::RelativePath;
 
@@ -333,6 +332,7 @@ mod tests {
         Metadata {
             size,
             mtime_sec,
+            mtime_nsec: 0,
             permissions,
             uid: 1000,
             gid: 1000,

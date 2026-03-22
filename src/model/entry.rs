@@ -15,6 +15,7 @@ pub enum EntryKind {
 pub struct Metadata {
     pub size: u64,
     pub mtime_sec: i64, // negative values are actually used for timestamps that date before 1970 :)
+    pub mtime_nsec: u32,
     pub permissions: u32,
     pub uid: u32,
     pub gid: u32,

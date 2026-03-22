@@ -2,20 +2,18 @@ use crate::format::header::FileHeader;
 use crate::model::diff::Change;
 use crate::model::entry::Entry;
 use anyhow::Result;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use serde::Serialize;
-use std::io::Write;
+use std::io::{Read, Write};
 
 pub trait FormatWriter<W: Write> {
     fn write_snapshot_entry(&mut self, entry: &Entry) -> Result<()>;
 
-    fn write_diff_change(&mut self, change: &crate::model::diff::Change) -> Result<()>;
+    fn write_diff_change(&mut self, change: &Change) -> Result<()>;
 
     /// Write raw file content from a reader, streaming it
-    fn write_file_content_from_reader(
-        &mut self,
-        reader: &mut dyn std::io::Read,
-        size: u64,
-    ) -> Result<()>;
+    fn write_file_content_from_reader(&mut self, reader: &mut dyn Read, size: u64) -> Result<()>;
 
     fn write_file_content(&mut self, content: &[u8]) -> Result<()>;
 }
@@ -32,6 +30,10 @@ enum JsonRecord<'a> {
     Header(&'a FileHeader),
     #[serde(rename = "snapshot_entry")]
     SnapshotEntry(&'a Entry),
+    #[serde(rename = "diff_change")]
+    DiffChange { change: &'a Change },
+    #[serde(rename = "file_content")]
+    FileContent { data: &'a str },
 }
 
 impl<W: Write> JsonFormatWriter<W> {
@@ -43,7 +45,8 @@ impl<W: Write> JsonFormatWriter<W> {
             bytes_written,
         })
     }
-    pub fn write_line(w: &mut W, record: &JsonRecord) -> Result<u64> {
+
+    fn write_line(w: &mut W, record: &JsonRecord) -> Result<u64> {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         w.write_all(&line)?;
@@ -58,25 +61,21 @@ impl<W: Write> FormatWriter<W> for JsonFormatWriter<W> {
     }
 
     fn write_diff_change(&mut self, change: &Change) -> Result<()> {
-        let payload = serde_json::to_vec(change)?;
-        self.inner.write_all(&payload)?;
+        self.bytes_written +=
+            Self::write_line(&mut self.inner, &JsonRecord::DiffChange { change })?;
         Ok(())
     }
 
-    fn write_file_content_from_reader(
-        &mut self,
-        reader: &mut dyn std::io::Read,
-        size: u64,
-    ) -> Result<()> {
-        let total_len = size as u32;
-        let len_bytes = total_len.to_le_bytes();
-        self.inner.write_all(&len_bytes)?;
-        std::io::copy(reader, &mut self.inner)?;
-        Ok(())
+    fn write_file_content_from_reader(&mut self, reader: &mut dyn Read, _size: u64) -> Result<()> {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        self.write_file_content(&buf)
     }
 
     fn write_file_content(&mut self, content: &[u8]) -> Result<()> {
-        self.inner.write_all(content)?;
+        let encoded = BASE64.encode(content);
+        self.bytes_written +=
+            Self::write_line(&mut self.inner, &JsonRecord::FileContent { data: &encoded })?;
         Ok(())
     }
 }

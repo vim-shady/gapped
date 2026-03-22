@@ -1,11 +1,16 @@
 use crate::format::header::FileHeader;
+use crate::model::diff::Change;
 use crate::model::entry::Entry;
 use anyhow::Result;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read};
 
 pub enum Record {
     SnapshotEntry(Entry),
+    DiffChange(Change),
+    FileContent(Vec<u8>),
 }
 
 pub trait FormatReader {
@@ -32,6 +37,10 @@ enum JsonRecord {
     Header(FileHeader),
     #[serde(rename = "snapshot_entry")]
     SnapshotEntry(Entry),
+    #[serde(rename = "diff_change")]
+    DiffChange { change: Change },
+    #[serde(rename = "file_content")]
+    FileContent { data: String },
 }
 
 impl<R: Read> JsonFormatReader<R> {
@@ -45,10 +54,10 @@ impl<R: Read> JsonFormatReader<R> {
             return Err(anyhow::anyhow!("Empty file"));
         }
 
-        let record: JsonRecord = serde_json::from_str(&line.trim())?;
+        let record: JsonRecord = serde_json::from_str(line.trim())?;
         let header = match record {
             JsonRecord::Header(header) => header,
-            _ => return Err(anyhow::anyhow!("Invalid file format")),
+            _ => return Err(anyhow::anyhow!("Expected header as first record")),
         };
 
         Ok((
@@ -74,10 +83,15 @@ impl<R: Read> FormatReader for JsonFormatReader<R> {
             return Ok(None);
         }
 
-        let record: JsonRecord = serde_json::from_str(&line.trim())?;
+        let record: JsonRecord = serde_json::from_str(line.trim())?;
         match record {
             JsonRecord::Header(_) => Err(anyhow::anyhow!("Unexpected header record in body")),
             JsonRecord::SnapshotEntry(entry) => Ok(Some(Record::SnapshotEntry(entry))),
+            JsonRecord::DiffChange { change } => Ok(Some(Record::DiffChange(change))),
+            JsonRecord::FileContent { data } => {
+                let bytes = BASE64.decode(&data)?;
+                Ok(Some(Record::FileContent(bytes)))
+            }
         }
     }
 }

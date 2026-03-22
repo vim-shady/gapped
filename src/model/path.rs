@@ -36,6 +36,11 @@ impl RelativePath {
     pub fn to_full_path(&self, root: &Path) -> PathBuf {
         root.join(&self.0)
     }
+
+    /// Return the number of components in the path
+    pub fn depth(&self) -> usize {
+        self.0.components().count()
+    }
 }
 
 impl AsRef<Path> for RelativePath {
