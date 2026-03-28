@@ -48,6 +48,33 @@ run_cycle() {
     $GAPPED apply "$DST" "$diff_out" 2>/dev/null
 }
 
+check_verify() {
+    local test_name="$1"
+    local diff_file="$2"
+    local snap_file="$3"
+    if $GAPPED verify "$DST" "$diff_file" "$snap_file" 2>/dev/null; then
+        echo "  PASS: $test_name"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL: $test_name (verify should have succeeded)"
+        fail=$((fail + 1))
+    fi
+}
+
+# Verify should fail (non-zero exit) after tampering
+check_verify_fails() {
+    local test_name="$1"
+    local diff_file="$2"
+    local snap_file="$3"
+    if $GAPPED verify "$DST" "$diff_file" "$snap_file" 2>/dev/null; then
+        echo "  FAIL: $test_name (verify should have failed but succeeded)"
+        fail=$((fail + 1))
+    else
+        echo "  PASS: $test_name"
+        pass=$((pass + 1))
+    fi
+}
+
 # --- Setup: initial state ---
 mkdir -p "$SRC/subdir"
 echo "hello world" > "$SRC/file1.txt"
@@ -119,6 +146,29 @@ check_rsync "deep nesting"
 echo "Test 10: No changes"
 run_cycle "$WORK/snap9.json" "$WORK/diff9.json" "$WORK/snap10.json"
 check_rsync "no changes"
+
+# --- Test 11: Verify succeeds when target matches ---
+echo "Test 11: Verify succeeds when target matches"
+# After test 10, DST is in sync. diff9 is empty, snap10 is the current state.
+check_verify "verify passes on clean target" "$WORK/diff9.json" "$WORK/snap10.json"
+
+# --- Test 12: Verify detects tampered file content ---
+echo "Test 12: Verify detects tampered file content"
+echo "tampered" > "$DST/file1.txt"
+check_verify_fails "verify detects tampered content" "$WORK/diff9.json" "$WORK/snap10.json"
+rsync -a "$SRC/" "$DST/"
+
+# --- Test 13: Verify detects extra file ---
+echo "Test 13: Verify detects extra file on target"
+echo "extra" > "$DST/extra.txt"
+check_verify_fails "verify detects extra file" "$WORK/diff9.json" "$WORK/snap10.json"
+rsync -a --delete "$SRC/" "$DST/"
+
+# --- Test 13: Verify detects missing file ---
+echo "Test 14: Verify detects missing file on target"
+rm "$DST/file1.txt"
+check_verify_fails "verify detects missing file" "$WORK/diff9.json" "$WORK/snap10.json"
+rsync -a "$SRC/" "$DST/"
 
 # --- Summary ---
 echo ""

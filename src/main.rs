@@ -9,6 +9,7 @@ use clap::Parser;
 use crate::commands::apply::run_apply;
 use crate::commands::diff::run_diff;
 use crate::commands::snapshot::run_snapshot;
+use crate::commands::verify::run_verify;
 use cli::{Cli, Commands};
 
 fn main() {
@@ -38,6 +39,15 @@ fn main() {
             compress,
         ),
         Commands::Apply { root_dir, diff_in } => run_apply(&root_dir, &diff_in),
-        Commands::Verify { .. } => unimplemented!(),
+        Commands::Verify {
+            root_dir,
+            diff_file,
+            snapshot_file,
+        } => run_verify(&root_dir, &diff_file, &snapshot_file),
     };
+
+    if let Err(e) = result {
+        eprintln!("Error: {:#}", e);
+        std::process::exit(1);
+    }
 }

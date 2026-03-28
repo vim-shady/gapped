@@ -189,6 +189,7 @@ pub fn run_apply(root_dir: &Path, diff_path: &Path) -> Result<()> {
                                 continue;
                             }
                             set_symlink_ownership(&full_path, &added.entry.metadata);
+                            set_mtime(&full_path, added.entry.metadata.mtime_sec, added.entry.metadata.mtime_nsec);
                         }
                     }
                 }
@@ -220,6 +221,7 @@ pub fn run_apply(root_dir: &Path, diff_path: &Path) -> Result<()> {
                         .unwrap_or(false);
                     if is_symlink {
                         set_symlink_ownership(&full_path, new_metadata);
+                        set_mtime(&full_path, new_metadata.mtime_sec, new_metadata.mtime_nsec);
                     } else {
                         let is_dir = full_path
                             .symlink_metadata()
