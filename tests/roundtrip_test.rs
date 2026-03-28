@@ -1,7 +1,8 @@
 use crate::helper::{TestFixture, create_file, run_gapped};
-use std::fs::remove_file;
+use std::fs::{remove_dir_all, remove_file};
 use std::os::unix::fs::symlink;
-use std::thread;
+use std::time::Duration;
+use std::{fs, thread};
 
 #[path = "helper.rs"]
 mod helper;
@@ -62,5 +63,299 @@ fn test_roundtrip() {
     ]));
 
     // Verify
+    assert!(fixture.verify_rsync_identical());
+}
+
+#[test]
+fn test_kind_change() {
+    let fixture = TestFixture::new();
+
+    // Create inital state
+    create_file(&fixture.source().join("subject1"), "I am a file\n");
+    symlink("subject1", fixture.source().join("subject2")).unwrap();
+
+    let snap1 = fixture.working_file("snap1");
+    assert!(run_gapped(&[
+        "snapshot",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+    ]));
+    fixture.sync_source_to_target();
+
+    // Change kind
+    thread::sleep(std::time::Duration::from_secs(1));
+    remove_file(fixture.source().join("subject1")).unwrap();
+    symlink("subject2", fixture.source().join("subject1")).unwrap();
+    remove_file(fixture.source().join("subject2")).unwrap();
+    create_file(&fixture.source().join("subject2"), "I am now a file\n");
+
+    let diff1 = fixture.working_file("diff1");
+    let snap2 = fixture.working_file("snap2");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+        diff1.to_str().unwrap(),
+        snap2.to_str().unwrap(),
+    ]));
+
+    assert!(run_gapped(&[
+        "apply",
+        fixture.target().to_str().unwrap(),
+        diff1.to_str().unwrap(),
+    ]));
+
+    assert!(fixture.verify_rsync_identical());
+}
+
+#[test]
+fn test_nesting() {
+    let fixture = TestFixture::new();
+
+    create_file(&fixture.source().join("a/b/c/d/deep.txt"), "deep\n");
+
+    let snap1 = fixture.working_file("snap1");
+    assert!(run_gapped(&[
+        "snapshot",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+    ]));
+    fixture.sync_source_to_target();
+
+    // Add deeper, modify existing
+    thread::sleep(std::time::Duration::from_secs(1));
+    create_file(
+        &fixture.source().join("a/b/c/d/e/deeper.txt"),
+        "even deeper\n",
+    );
+    create_file(&fixture.source().join("a/b/c/d/deep.txt"), "modified\n");
+
+    let diff1 = fixture.working_file("diff1");
+    let snap2 = fixture.working_file("snap2");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+        diff1.to_str().unwrap(),
+        snap2.to_str().unwrap(),
+    ]));
+
+    assert!(run_gapped(&[
+        "apply",
+        fixture.target().to_str().unwrap(),
+        diff1.to_str().unwrap(),
+    ]));
+
+    assert!(fixture.verify_rsync_identical());
+}
+
+#[test]
+fn test_directory_removal() {
+    let fixture = TestFixture::new();
+
+    create_file(&fixture.source().join("dir/file1.txt"), "content\n");
+    create_file(&fixture.source().join("dir/subdir/file2.txt"), "nested\n");
+
+    let snap1 = fixture.working_file("snap1");
+    assert!(run_gapped(&[
+        "snapshot",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+    ]));
+    fixture.sync_source_to_target();
+
+    // delete entire directory tree
+    thread::sleep(std::time::Duration::from_secs(1));
+    remove_dir_all(fixture.source().join("dir")).unwrap();
+
+    let diff1 = fixture.working_file("diff1");
+    let snap2 = fixture.working_file("snap2");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+        diff1.to_str().unwrap(),
+        snap2.to_str().unwrap(),
+    ]));
+
+    assert!(run_gapped(&[
+        "apply",
+        fixture.target().to_str().unwrap(),
+        diff1.to_str().unwrap(),
+    ]));
+
+    assert!(fixture.verify_rsync_identical());
+}
+
+#[test]
+fn test_verify() {
+    let fixture = TestFixture::new();
+
+    create_file(&fixture.source().join("file1.txt"), "content\n");
+
+    let snap1 = fixture.working_file("snap1");
+    assert!(run_gapped(&[
+        "snapshot",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+    ]));
+    fixture.sync_source_to_target();
+
+    thread::sleep(std::time::Duration::from_secs(1));
+    create_file(&fixture.source().join("file1.txt"), "modfified\n");
+    create_file(&fixture.source().join("file2.txt"), "new file\n");
+
+    let diff1 = fixture.working_file("diff1");
+    let snap2 = fixture.working_file("snap2");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+        diff1.to_str().unwrap(),
+        snap2.to_str().unwrap(),
+    ]));
+
+    // Apply diff first
+    assert!(run_gapped(&[
+        "apply",
+        fixture.target().to_str().unwrap(),
+        diff1.to_str().unwrap(),
+    ]));
+
+    // Take snapshot of target after apply
+    let target_snap = fixture.working_file("target_snap");
+    assert!(run_gapped(&[
+        "snapshot",
+        fixture.target().to_str().unwrap(),
+        target_snap.to_str().unwrap(),
+    ]));
+
+    // make some more changes
+    thread::sleep(std::time::Duration::from_secs(1));
+    create_file(&fixture.source().join("file1.txt"), "modified again\n");
+    remove_file(fixture.source().join("file2.txt")).unwrap();
+
+    let diff2 = fixture.working_file("diff2");
+    let snap3 = fixture.working_file("snap3");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        snap2.to_str().unwrap(),
+        diff2.to_str().unwrap(),
+        snap3.to_str().unwrap(),
+    ]));
+
+    // applying diff2 to current target should produce snap3
+    assert!(run_gapped(&[
+        "verify",
+        fixture.target().to_str().unwrap(),
+        diff2.to_str().unwrap(),
+        snap3.to_str().unwrap(),
+    ]))
+}
+
+#[test]
+fn test_iterative_sync() {
+    let fixture = TestFixture::new();
+
+    // Setup
+    create_file(&fixture.source().join("file1.txt"), "v1\n");
+
+    let snap1 = fixture.working_file("snap1");
+    assert!(run_gapped(&[
+        "snapshot",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+    ]));
+    fixture.sync_source_to_target();
+
+    // round 1
+    thread::sleep(std::time::Duration::from_secs(1));
+    create_file(&fixture.source().join("file1.txt"), "v2\n");
+    create_file(&fixture.source().join("file2.txt"), "new\n");
+
+    let diff1 = fixture.working_file("diff1");
+    let snap2 = fixture.working_file("snap2");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+        diff1.to_str().unwrap(),
+        snap2.to_str().unwrap(),
+    ]));
+    assert!(run_gapped(&[
+        "apply",
+        fixture.target().to_str().unwrap(),
+        diff1.to_str().unwrap(),
+    ]));
+    assert!(fixture.verify_rsync_identical());
+
+    // round 2
+    thread::sleep(std::time::Duration::from_secs(1));
+    remove_file(fixture.source().join("file2.txt")).unwrap();
+    create_file(&fixture.source().join("file3.txt"), "new\n");
+
+    let diff2 = fixture.working_file("diff2");
+    let snap3 = fixture.working_file("snap3");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        snap2.to_str().unwrap(),
+        diff2.to_str().unwrap(),
+        snap3.to_str().unwrap(),
+    ]));
+    assert!(run_gapped(&[
+        "diff",
+        fixture.target().to_str().unwrap(),
+        snap2.to_str().unwrap(),
+        diff2.to_str().unwrap(),
+        snap3.to_str().unwrap(),
+    ]));
+    assert!(run_gapped(&[
+        "apply",
+        fixture.target().to_str().unwrap(),
+        diff2.to_str().unwrap(),
+    ]));
+    assert!(fixture.verify_rsync_identical());
+}
+
+#[test]
+fn test_permission_change() {
+    let fixture = TestFixture::new();
+
+    create_file(&fixture.source().join("script.sh"), "#/bin/bash\n");
+
+    let snap1 = fixture.working_file("snap1");
+    assert!(run_gapped(&[
+        "snapshot",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+    ]));
+    fixture.sync_source_to_target();
+
+    // change permissisons only
+    thread::sleep(Duration::from_secs(1));
+    fs::set_permissions(
+        fixture.source().join("script.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+
+    let diff1 = fixture.working_file("diff1");
+    let snap2 = fixture.working_file("snap2");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        snap1.to_str().unwrap(),
+        diff1.to_str().unwrap(),
+        snap2.to_str().unwrap(),
+    ]));
+
+    assert!(run_gapped(&[
+        "apply",
+        fixture.target().to_str().unwrap(),
+        diff1.to_str().unwrap(),
+    ]));
+
     assert!(fixture.verify_rsync_identical());
 }
