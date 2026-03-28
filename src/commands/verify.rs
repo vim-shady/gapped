@@ -1,5 +1,5 @@
 use crate::commands::snapshot::load_snapshot_entries;
-use crate::format::reader::{FormatReader, JsonFormatReader, Record};
+use crate::format::reader::{FormatReader, Record};
 use crate::fs::walk::walk_filesystem;
 use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::Entry;
@@ -42,7 +42,7 @@ pub fn run_verify(root_dir: &Path, diff_file: &Path, snapshot_path: &Path) -> Re
     info!("Loading diff from {}", diff_file.display());
     let file = File::open(diff_file)?;
     let reader = BufReader::new(file);
-    let (mut format_reader, _header) = JsonFormatReader::new(reader)?;
+    let (mut format_reader, _header) = FormatReader::new(reader)?;
 
     let records = format_reader.read_all_records()?;
 

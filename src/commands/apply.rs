@@ -1,4 +1,4 @@
-use crate::format::reader::{FormatReader, JsonFormatReader, Record};
+use crate::format::reader::{FormatReader, Record};
 use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::{EntryKind, Metadata};
 use anyhow::Result;
@@ -6,9 +6,9 @@ use log::{info, warn};
 use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::{symlink_metadata, File, Permissions};
+use std::fs::{File, Permissions, symlink_metadata};
 use std::io::BufReader;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 pub fn run_apply(root_dir: &Path, diff_path: &Path) -> Result<()> {
@@ -26,7 +26,7 @@ pub fn run_apply(root_dir: &Path, diff_path: &Path) -> Result<()> {
     info!("Loading changes from {}", diff_path.display());
     let file = File::open(diff_path)?;
     let reader = BufReader::new(file);
-    let (mut format_reader, _header) = JsonFormatReader::new(reader)?;
+    let (mut format_reader, _header) = FormatReader::new(reader)?;
 
     let records = format_reader.read_all_records()?;
 
@@ -189,7 +189,11 @@ pub fn run_apply(root_dir: &Path, diff_path: &Path) -> Result<()> {
                                 continue;
                             }
                             set_symlink_ownership(&full_path, &added.entry.metadata);
-                            set_mtime(&full_path, added.entry.metadata.mtime_sec, added.entry.metadata.mtime_nsec);
+                            set_mtime(
+                                &full_path,
+                                added.entry.metadata.mtime_sec,
+                                added.entry.metadata.mtime_nsec,
+                            );
                         }
                     }
                 }
@@ -330,12 +334,11 @@ fn set_symlink_ownership(path: &Path, metadata: &Metadata) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::header::FileHeader;
+    use crate::format::writer::FormatWriter;
     use crate::model::diff::{AddedEntry, ModifiedEntry};
     use crate::model::entry::Entry;
     use crate::model::path::RelativePath;
-    use base64::engine::general_purpose::STANDARD as BASE64;
-    use base64::Engine;
-    use std::io::Write as _;
     use tempfile::TempDir;
 
     fn make_metadata(size: u64, perms: u32) -> Metadata {
@@ -349,32 +352,20 @@ mod tests {
         }
     }
 
-    fn diff_change_json(change: &Change) -> String {
-        format!(
-            r#"{{"type":"diff_change","change":{}}}"#,
-            serde_json::to_string(change).unwrap()
-        )
-    }
-
-    fn file_content_json(data: &[u8]) -> String {
-        format!(
-            r#"{{"type":"file_content","data":"{}"}}"#,
-            BASE64.encode(data)
-        )
-    }
-
-    /// Build a JSON-line diff file from a list of record lines.
-    fn build_diff_file(dir: &Path, records: &[String]) -> PathBuf {
+    /// Build a binary diff file using FormatWriter.
+    fn build_diff_file(dir: &Path, write_records: impl FnOnce(&mut FormatWriter<File>)) -> PathBuf {
         let diff_path = dir.join("test.diff");
-        let mut file = File::create(&diff_path).unwrap();
-        writeln!(
-            file,
-            r#"{{"type":"header","file_type":"diff","version":1,"created_at":0,"source_snapshot_hash":null,"root_dir":null}}"#
-        )
-        .unwrap();
-        for record in records {
-            writeln!(file, "{}", record).unwrap();
-        }
+        let file = File::create(&diff_path).unwrap();
+        let header = FileHeader {
+            file_type: "diff".to_string(),
+            version: 1,
+            created_at: 0,
+            source_snapshot_hash: None,
+            root_dir: None,
+        };
+        let mut writer = FormatWriter::new(file, &header).unwrap();
+        write_records(&mut writer);
+        writer.finish().unwrap();
         diff_path
     }
 
@@ -419,10 +410,10 @@ mod tests {
             }),
         };
 
-        let diff_path = build_diff_file(
-            dir.path(),
-            &[diff_change_json(&change), file_content_json(b"hello")],
-        );
+        let diff_path = build_diff_file(dir.path(), |w| {
+            w.write_diff_change(&change).unwrap();
+            w.write_file_content(b"hello").unwrap();
+        });
         run_apply(&root, &diff_path).unwrap();
 
         assert_eq!(fs::read(root.join("hello.txt")).unwrap(), b"hello");
@@ -440,7 +431,9 @@ mod tests {
             kind: ChangeKind::Removed(EntryKind::File),
         };
 
-        let diff_path = build_diff_file(dir.path(), &[diff_change_json(&change)]);
+        let diff_path = build_diff_file(dir.path(), |w| {
+            w.write_diff_change(&change).unwrap();
+        });
         run_apply(&root, &diff_path).unwrap();
 
         assert!(!root.join("bye.txt").exists());
@@ -463,10 +456,10 @@ mod tests {
             }),
         };
 
-        let diff_path = build_diff_file(
-            dir.path(),
-            &[diff_change_json(&change), file_content_json(b"new")],
-        );
+        let diff_path = build_diff_file(dir.path(), |w| {
+            w.write_diff_change(&change).unwrap();
+            w.write_file_content(b"new").unwrap();
+        });
         run_apply(&root, &diff_path).unwrap();
 
         assert_eq!(fs::read(root.join("data.txt")).unwrap(), b"new");
@@ -492,7 +485,9 @@ mod tests {
             }),
         };
 
-        let diff_path = build_diff_file(dir.path(), &[diff_change_json(&change)]);
+        let diff_path = build_diff_file(dir.path(), |w| {
+            w.write_diff_change(&change).unwrap();
+        });
         run_apply(&root, &diff_path).unwrap();
 
         assert!(root.join("subdir").is_dir());
@@ -505,22 +500,23 @@ mod tests {
         fs::create_dir_all(root.join("a/b")).unwrap();
         fs::write(root.join("a/b/file.txt"), b"x").unwrap();
 
-        let records = vec![
-            diff_change_json(&Change {
+        let diff_path = build_diff_file(dir.path(), |w| {
+            w.write_diff_change(&Change {
                 path: RelativePath::new(Path::new("a/b/file.txt")).unwrap(),
                 kind: ChangeKind::Removed(EntryKind::File),
-            }),
-            diff_change_json(&Change {
+            })
+            .unwrap();
+            w.write_diff_change(&Change {
                 path: RelativePath::new(Path::new("a/b")).unwrap(),
                 kind: ChangeKind::Removed(EntryKind::Directory),
-            }),
-            diff_change_json(&Change {
+            })
+            .unwrap();
+            w.write_diff_change(&Change {
                 path: RelativePath::new(Path::new("a")).unwrap(),
                 kind: ChangeKind::Removed(EntryKind::Directory),
-            }),
-        ];
-
-        let diff_path = build_diff_file(dir.path(), &records);
+            })
+            .unwrap();
+        });
         run_apply(&root, &diff_path).unwrap();
 
         assert!(!root.join("a").exists());

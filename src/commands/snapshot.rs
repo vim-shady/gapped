@@ -1,6 +1,6 @@
 use crate::format::header::FileHeader;
-use crate::format::reader::{FormatReader, JsonFormatReader, Record};
-use crate::format::writer::{FormatWriter, JsonFormatWriter};
+use crate::format::reader::{FormatReader, Record};
+use crate::format::writer::FormatWriter;
 use crate::fs::walk::walk_filesystem;
 use crate::model::entry::Entry;
 use crate::model::path::RelativePath;
@@ -18,10 +18,10 @@ pub fn load_snapshot_entries(
 ) -> Result<(HashMap<RelativePath, Entry>, FileHeader)> {
     let file = File::open(snapshot_path)?;
     let reader = std::io::BufReader::new(file);
-    let (mut json_reader, header) = JsonFormatReader::new(reader)?;
+    let (mut format_reader, header) = FormatReader::new(reader)?;
 
     let mut entries: HashMap<RelativePath, Entry> = HashMap::new();
-    let records = json_reader.read_all_records()?;
+    let records = format_reader.read_all_records()?;
     for record in records {
         if let Record::SnapshotEntry(entry) = record {
             entries.insert(entry.path.clone(), entry);
@@ -34,10 +34,10 @@ pub fn load_snapshot_entries(
 pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
     let file = File::open(snapshot_path)?;
     let reader = std::io::BufReader::new(file);
-    let (mut json_reader, header) = JsonFormatReader::new(reader)?;
+    let (mut format_reader, header) = FormatReader::new(reader)?;
 
     let mut entries = Vec::new();
-    let records = json_reader.read_all_records()?;
+    let records = format_reader.read_all_records()?;
     for record in records {
         if let Record::SnapshotEntry(entry) = record {
             entries.push(entry);
@@ -90,14 +90,16 @@ pub fn run_snapshot(
     };
 
     let mut writer = if compress {
-        todo!() // Todo: implement compression
+        FormatWriter::new_compressed(buf_writer, &header)?
     } else {
-        JsonFormatWriter::new(buf_writer, &header)?
+        FormatWriter::new(buf_writer, &header)?
     };
 
     for entry in &entries {
         writer.write_snapshot_entry(entry)?;
     }
+
+    writer.finish()?;
 
     // Report statistics
     eprintln!("Snapshot complete:");

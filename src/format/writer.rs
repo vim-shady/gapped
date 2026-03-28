@@ -1,81 +1,172 @@
-use crate::format::header::FileHeader;
+use crate::format::header::{EOR, FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
 use crate::model::diff::Change;
 use crate::model::entry::Entry;
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use serde::Serialize;
-use std::io::{Read, Write};
+use std::io;
+use std::io::Write;
 
-pub trait FormatWriter<W: Write> {
-    fn write_snapshot_entry(&mut self, entry: &Entry) -> Result<()>;
-
-    fn write_diff_change(&mut self, change: &Change) -> Result<()>;
-
-    /// Write raw file content from a reader, streaming it
-    fn write_file_content_from_reader(&mut self, reader: &mut dyn Read, size: u64) -> Result<()>;
-
-    fn write_file_content(&mut self, content: &[u8]) -> Result<()>;
-}
-
-pub struct JsonFormatWriter<W: Write> {
-    inner: W,
+/// Streaming writer for gapped file format
+/// Writes records one at a time, computing a checksum for everything written
+pub struct FormatWriter<W: Write> {
+    inner: WriterInner<W>,
+    hasher: blake3::Hasher,
     bytes_written: u64,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "type")]
-enum JsonRecord<'a> {
-    #[serde(rename = "header")]
-    Header(&'a FileHeader),
-    #[serde(rename = "snapshot_entry")]
-    SnapshotEntry(&'a Entry),
-    #[serde(rename = "diff_change")]
-    DiffChange { change: &'a Change },
-    #[serde(rename = "file_content")]
-    FileContent { data: &'a str },
+enum WriterInner<W: Write> {
+    Plain(W),
+    Compressed(zstd::stream::write::Encoder<'static, W>),
 }
 
-impl<W: Write> JsonFormatWriter<W> {
-    pub fn new(mut inner: W, header: &FileHeader) -> Result<Self> {
-        let mut bytes_written = 0u64;
-        bytes_written += Self::write_line(&mut inner, &JsonRecord::Header(header))?;
-        Ok(JsonFormatWriter {
-            inner,
-            bytes_written,
+impl<W: Write> WriterInner<W> {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            WriterInner::Plain(w) => w.write_all(buf),
+            WriterInner::Compressed(w) => w.write_all(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            WriterInner::Plain(w) => w.flush(),
+            WriterInner::Compressed(w) => w.flush(),
+        }
+    }
+}
+
+impl<W: Write> FormatWriter<W> {
+    /// Create a new FormatWriter and write magic bytes + header
+    pub fn new(inner: W, header: &FileHeader) -> Result<Self> {
+        Self::new_impl(inner, header, false)
+    }
+
+    /// Create a new compressed FormatWriter
+    pub fn new_compressed(inner: W, header: &FileHeader) -> Result<Self> {
+        Self::new_impl(inner, header, true)
+    }
+
+    fn new_impl(mut inner: W, header: &FileHeader, compress: bool) -> Result<Self> {
+        let mut hasher = blake3::Hasher::new();
+
+        // Write magic bytes (uncompressed, so readers can detect format)
+        let magic = if compress { MAGIC_COMPRESSED } else { MAGIC };
+        inner.write_all(magic)?;
+        hasher.update(magic);
+
+        // Write with compression
+        let mut writer_inner = if compress {
+            let encoder = zstd::stream::write::Encoder::new(inner, 3)?;
+            WriterInner::Compressed(encoder)
+        } else {
+            WriterInner::Plain(inner)
+        };
+
+        // Serialize and write header
+        let header_bytes = rmp_serde::to_vec(header)?;
+        let header_len = (header_bytes.len() as u32).to_le_bytes();
+        writer_inner.write_all(&header_len)?;
+        hasher.update(&header_len);
+        writer_inner.write_all(&header_bytes)?;
+        hasher.update(&header_bytes);
+
+        Ok(FormatWriter {
+            inner: writer_inner,
+            hasher,
+            bytes_written: 9, // magic
         })
     }
 
-    fn write_line(w: &mut W, record: &JsonRecord) -> Result<u64> {
-        let mut line = serde_json::to_vec(record)?;
-        line.push(b'\n');
-        w.write_all(&line)?;
-        Ok(line.len() as u64)
-    }
-}
-
-impl<W: Write> FormatWriter<W> for JsonFormatWriter<W> {
-    fn write_snapshot_entry(&mut self, entry: &Entry) -> Result<()> {
-        self.bytes_written += Self::write_line(&mut self.inner, &JsonRecord::SnapshotEntry(entry))?;
+    /// Write a snapshot entry record.
+    pub fn write_snapshot_entry(&mut self, entry: &Entry) -> Result<()> {
+        let payload = rmp_serde::to_vec(entry)?;
+        self.write_record(RecordType::SnapshotEntry, &payload)?;
         Ok(())
     }
 
-    fn write_diff_change(&mut self, change: &Change) -> Result<()> {
-        self.bytes_written +=
-            Self::write_line(&mut self.inner, &JsonRecord::DiffChange { change })?;
+    /// Write a diff change record.
+    pub fn write_diff_change(&mut self, change: &Change) -> Result<()> {
+        let payload = rmp_serde::to_vec(change)?;
+        self.write_record(RecordType::DiffChange, &payload)?;
         Ok(())
     }
 
-    fn write_file_content_from_reader(&mut self, reader: &mut dyn Read, _size: u64) -> Result<()> {
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
-        self.write_file_content(&buf)
+    /// Write raw file content.
+    pub fn write_file_content(&mut self, content: &[u8]) -> Result<()> {
+        self.write_record(RecordType::FileContent, content)?;
+        Ok(())
     }
 
-    fn write_file_content(&mut self, content: &[u8]) -> Result<()> {
-        let encoded = BASE64.encode(content);
-        self.bytes_written +=
-            Self::write_line(&mut self.inner, &JsonRecord::FileContent { data: &encoded })?;
+    /// Write raw file content streaming from a reader.
+    pub fn write_file_content_from_reader<R: io::Read>(
+        &mut self,
+        reader: &mut R,
+        size: u64,
+    ) -> Result<()> {
+        let total_len = size as u32;
+        let len_bytes = total_len.to_le_bytes();
+        let type_byte = [RecordType::FileContent as u8];
+
+        self.inner.write_all(&len_bytes)?;
+        self.hasher.update(&len_bytes);
+        self.inner.write_all(&type_byte)?;
+        self.hasher.update(&type_byte);
+        self.bytes_written += 5;
+
+        let mut buf = [0u8; 64 * 1024];
+        let mut remaining = size;
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            let n = reader.read(&mut buf[..to_read])?;
+            if n == 0 {
+                let pad = vec![0u8; remaining as usize];
+                self.inner.write_all(&pad)?;
+                self.hasher.update(&pad);
+                self.bytes_written += remaining;
+                break;
+            }
+            self.inner.write_all(&buf[..n])?;
+            self.hasher.update(&buf[..n]);
+            self.bytes_written += n as u64;
+            remaining -= n as u64;
+        }
+
+        Ok(())
+    }
+
+    /// Finalize the file by writing EOR marker and checksum
+    pub fn finish(mut self) -> Result<W> {
+        self.inner.write_all(&EOR)?;
+        self.hasher.update(&EOR);
+
+        let hash = self.hasher.finalize();
+        self.inner.write_all(hash.as_bytes())?;
+        self.inner.flush()?;
+
+        // Finish compression
+        match self.inner {
+            WriterInner::Plain(writer) => Ok(writer),
+            WriterInner::Compressed(encoder) => {
+                let writer = encoder.finish()?;
+                Ok(writer)
+            }
+        }
+    }
+
+    /// Write a single record
+    fn write_record(&mut self, record_type: RecordType, payload: &[u8]) -> Result<()> {
+        let len_bytes = (payload.len() as u32).to_le_bytes();
+        let type_byte = [record_type as u8];
+
+        self.inner.write_all(&len_bytes)?;
+        self.hasher.update(&len_bytes);
+        self.inner.write_all(&type_byte)?;
+        self.hasher.update(&type_byte);
+        self.bytes_written += 5;
+
+        self.inner.write_all(payload)?;
+        self.hasher.update(payload);
+        self.bytes_written += payload.len() as u64;
+
         Ok(())
     }
 }
