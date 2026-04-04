@@ -6,7 +6,7 @@ mod model;
 
 use clap::Parser;
 
-use crate::commands::apply::run_apply;
+use crate::commands::apply::{detect_diff_files, run_apply};
 use crate::commands::diff::run_diff;
 use crate::commands::snapshot::run_snapshot;
 use crate::commands::verify::run_verify;
@@ -38,7 +38,15 @@ fn main() {
             split_size,
             compress,
         ),
-        Commands::Apply { root_dir, diff_in } => run_apply(&root_dir, &diff_in),
+        Commands::Apply { root_dir, diff_in } => {
+            let diff_files = detect_diff_files(&diff_in);
+            if diff_files.is_empty() {
+                eprintln!("Error: No diff file(s) found at {}", diff_in.display());
+                std::process::exit(1);
+            }
+            let diff_refs: Vec<&std::path::Path> = diff_files.iter().map(|p| p.as_path()).collect();
+            run_apply(&root_dir, &diff_refs)
+        }
         Commands::Verify {
             root_dir,
             diff_file,

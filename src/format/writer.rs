@@ -169,4 +169,9 @@ impl<W: Write> FormatWriter<W> {
 
         Ok(())
     }
+
+    /// Get approximate number of bytes written
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
 }

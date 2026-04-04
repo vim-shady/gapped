@@ -87,6 +87,8 @@ pub fn run_snapshot(
             .as_secs() as i64,
         source_snapshot_hash: None,
         root_dir: Some(root_dir.to_string_lossy().to_string()),
+        chunk_index: None,
+        more_chunks: None
     };
 
     let mut writer = if compress {

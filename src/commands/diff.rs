@@ -117,6 +117,8 @@ fn write_snapshot(
             .as_secs() as i64,
         source_snapshot_hash: None,
         root_dir: Some(root_dir.to_string_lossy().into_owned()),
+        chunk_index: None,
+        more_chunks: None,
     };
 
     let mut writer: FormatWriter<BufWriter<File>> = if compress {
@@ -133,15 +135,75 @@ fn write_snapshot(
     Ok(())
 }
 
+/// Write split diff files
 fn write_split_diff(
-    p0: &Path,
-    p1: &Vec<Change>,
-    p2: [u8; 32],
-    p3: &PathBuf,
-    p4: u64,
-    p5: bool,
+    diff_out: &Path,
+    changes: &Vec<Change>,
+    source_snapshot_hash: [u8; 32],
+    root_dir: &Path,
+    max_bytes: u64,
+    compress: bool,
 ) -> Result<()> {
-    todo!()
+    let diff_out_str = diff_out.to_string_lossy();
+    let mut chunk_index: u32 = 0;
+    let mut change_index = 0;
+
+    while change_index < changes.len() {
+        let chunk_path = format!("{}.{:03}", diff_out_str, chunk_index + 1);
+        let file = File::create(&chunk_path)?;
+        let buf_writer = BufWriter::new(file);
+
+        let header = FileHeader {
+            file_type: "diff".to_string(),
+            version: Diff::CURRENT_VERSION,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            source_snapshot_hash: Some(source_snapshot_hash),
+            root_dir: None,
+            chunk_index: Some(chunk_index),
+            more_chunks: None,
+        };
+        let mut writer: FormatWriter<BufWriter<File>> = if compress {
+            FormatWriter::new_compressed(buf_writer, &header)?
+        } else {
+            FormatWriter::new(buf_writer, &header)?
+        };
+
+        // write changes until size limit
+        while change_index < changes.len() {
+            let change = &changes[change_index];
+            writer.write_diff_change(change)?;
+
+            // write file content if needed
+            match &change.kind {
+                ChangeKind::Added(added) if added.has_content => {
+                    let full_path = change.path.to_full_path(root_dir);
+                    let content = std::fs::read(&full_path).unwrap_or_default();
+                    writer.write_file_content(&content)?;
+                }
+                ChangeKind::Modified(modified) if modified.has_content => {
+                    let full_path = change.path.to_full_path(root_dir);
+                    let content = std::fs::read(&full_path).unwrap_or_default();
+                    writer.write_file_content(&content)?;
+                }
+                _ => {}
+            }
+            change_index += 1;
+
+            // check if size limit exceeded
+            if writer.bytes_written() >= max_bytes && change_index < changes.len() {
+                break;
+            }
+        }
+
+        writer.finish()?;
+        chunk_index += 1;
+    }
+
+    info!("Wrote {} diff chunks", chunk_index);
+    Ok(())
 }
 
 fn write_single_diff(
@@ -163,6 +225,8 @@ fn write_single_diff(
             .as_secs() as i64,
         source_snapshot_hash: Some(source_snapshot_hash),
         root_dir: None,
+        chunk_index: None,
+        more_chunks: None,
     };
 
     let mut writer = if compress {
@@ -376,8 +440,8 @@ mod tests {
     }
 
     fn summarize(changes: &[Change]) -> Vec<(&RelativePath, &str)> {
-        changes.
-            iter()
+        changes
+            .iter()
             .map(|c| {
                 let kind_str = match c.kind {
                     ChangeKind::Added(_) => "A",
@@ -400,7 +464,10 @@ mod tests {
 
         let root = PathBuf::from("/dummy");
         let changes = compute_diff(&entries, &entries, &root).unwrap();
-        assert!(changes.is_empty(), "Identical snapshots should produce no changes");
+        assert!(
+            changes.is_empty(),
+            "Identical snapshots should produce no changes"
+        );
     }
 
     #[test]
@@ -415,7 +482,11 @@ mod tests {
         let changes = compute_diff(&old, &new, &root).unwrap();
 
         assert_eq!(changes.len(), 2);
-        assert!(changes.iter().all(|c| matches!(c.kind, ChangeKind::Added(_))));
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c.kind, ChangeKind::Added(_)))
+        );
     }
 
     #[test]
@@ -430,7 +501,11 @@ mod tests {
         let changes = compute_diff(&old, &new, &root).unwrap();
 
         assert_eq!(changes.len(), 2);
-        assert!(changes.iter().all(|c| matches!(c.kind, ChangeKind::Removed(_))));
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c.kind, ChangeKind::Removed(_)))
+        );
     }
 
     #[test]
@@ -449,7 +524,10 @@ mod tests {
         let changes = compute_diff(&old, &new, &root).unwrap();
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, RelativePath::new(Path::new("b.txt")).unwrap());
+        assert_eq!(
+            changes[0].path,
+            RelativePath::new(Path::new("b.txt")).unwrap()
+        );
         assert!(matches!(changes[0].kind, ChangeKind::Added(_)));
 
         // Added file should have has_content = true
@@ -474,14 +552,30 @@ mod tests {
         let changes = compute_diff(&old, &new, &root).unwrap();
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, RelativePath::new(Path::new("b.txt")).unwrap());
-        assert!(matches!(changes[0].kind, ChangeKind::Removed(EntryKind::File)));
+        assert_eq!(
+            changes[0].path,
+            RelativePath::new(Path::new("b.txt")).unwrap()
+        );
+        assert!(matches!(
+            changes[0].kind,
+            ChangeKind::Removed(EntryKind::File)
+        ));
     }
 
     #[test]
     fn test_file_content_changed() {
-        let old = vec![make_file(Path::new("a.txt"), 100, 1000, Some(dummy_hash(1)))];
-        let new = vec![make_file(Path::new("a.txt"), 150, 2000, Some(dummy_hash(2)))];
+        let old = vec![make_file(
+            Path::new("a.txt"),
+            100,
+            1000,
+            Some(dummy_hash(1)),
+        )];
+        let new = vec![make_file(
+            Path::new("a.txt"),
+            150,
+            2000,
+            Some(dummy_hash(2)),
+        )];
 
         let root = PathBuf::from("/dummy");
         let changes = compute_diff(&old, &new, &root).unwrap();
@@ -490,7 +584,10 @@ mod tests {
         if let ChangeKind::Modified(ref m) = changes[0].kind {
             assert!(m.has_content, "Content change should include file content");
             assert!(m.new_hash.is_some(), "Should carry new hash");
-            assert!(m.new_metadata.is_some(), "Metadata also changed (size, mtime)");
+            assert!(
+                m.new_metadata.is_some(),
+                "Metadata also changed (size, mtime)"
+            );
         } else {
             panic!("Expected Modified change");
         }
@@ -498,16 +595,32 @@ mod tests {
 
     #[test]
     fn test_metadata_only_change_no_content() {
-        let old = vec![make_file(Path::new("a.txt"), 100, 1000, Some(dummy_hash(1)))];
-        let new = vec![make_file(Path::new("a.txt"), 100, 2000, Some(dummy_hash(1)))]; // same hash, diff mtime
+        let old = vec![make_file(
+            Path::new("a.txt"),
+            100,
+            1000,
+            Some(dummy_hash(1)),
+        )];
+        let new = vec![make_file(
+            Path::new("a.txt"),
+            100,
+            2000,
+            Some(dummy_hash(1)),
+        )]; // same hash, diff mtime
 
         let root = PathBuf::from("/dummy");
         let changes = compute_diff(&old, &new, &root).unwrap();
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
-            assert!(!m.has_content, "Metadata-only change must NOT include content");
-            assert!(m.new_hash.is_none(), "Hash unchanged → new_hash should be None");
+            assert!(
+                !m.has_content,
+                "Metadata-only change must NOT include content"
+            );
+            assert!(
+                m.new_hash.is_none(),
+                "Hash unchanged → new_hash should be None"
+            );
             assert!(m.new_metadata.is_some(), "Should carry updated metadata");
         } else {
             panic!("Expected Modified change");
@@ -527,7 +640,10 @@ mod tests {
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
-            assert!(!m.has_content, "Permission-only change must NOT include content");
+            assert!(
+                !m.has_content,
+                "Permission-only change must NOT include content"
+            );
             assert!(m.new_metadata.is_some());
         } else {
             panic!("Expected Modified change");
@@ -556,7 +672,12 @@ mod tests {
 
     #[test]
     fn test_type_change_file_to_dir() {
-        let old = vec![make_file(Path::new("thing"), 100, 1000, Some(dummy_hash(1)))];
+        let old = vec![make_file(
+            Path::new("thing"),
+            100,
+            1000,
+            Some(dummy_hash(1)),
+        )];
         let new = vec![make_dir(Path::new("thing"), 2000)];
 
         let root = PathBuf::from("/dummy");
@@ -564,7 +685,10 @@ mod tests {
 
         // Type change should produce a Remove (old type) then Add (new type)
         assert_eq!(changes.len(), 2);
-        assert!(matches!(changes[0].kind, ChangeKind::Removed(EntryKind::File)));
+        assert!(matches!(
+            changes[0].kind,
+            ChangeKind::Removed(EntryKind::File)
+        ));
         assert!(matches!(changes[1].kind, ChangeKind::Added(_)));
         assert_eq!(changes[0].path, changes[1].path);
     }
@@ -578,7 +702,10 @@ mod tests {
         let changes = compute_diff(&old, &new, &root).unwrap();
 
         assert_eq!(changes.len(), 2);
-        assert!(matches!(changes[0].kind, ChangeKind::Removed(EntryKind::Directory)));
+        assert!(matches!(
+            changes[0].kind,
+            ChangeKind::Removed(EntryKind::Directory)
+        ));
         assert!(matches!(changes[1].kind, ChangeKind::Added(_)));
     }
 
@@ -591,7 +718,10 @@ mod tests {
         let changes = compute_diff(&old, &new, &root).unwrap();
 
         assert_eq!(changes.len(), 2);
-        assert!(matches!(changes[0].kind, ChangeKind::Removed(EntryKind::Symlink)));
+        assert!(matches!(
+            changes[0].kind,
+            ChangeKind::Removed(EntryKind::Symlink)
+        ));
         assert!(matches!(changes[1].kind, ChangeKind::Added(_)));
 
         // The added file should have content
@@ -603,14 +733,14 @@ mod tests {
     #[test]
     fn test_mixed_changes() {
         let old = vec![
-            make_file(Path::new("a.txt"), 10, 1000, Some(dummy_hash(1))),  // will be removed
-            make_file(Path::new("b.txt"), 20, 1000, Some(dummy_hash(2))),  // unchanged
-            make_file(Path::new("c.txt"), 30, 1000, Some(dummy_hash(3))),  // will be modified
+            make_file(Path::new("a.txt"), 10, 1000, Some(dummy_hash(1))), // will be removed
+            make_file(Path::new("b.txt"), 20, 1000, Some(dummy_hash(2))), // unchanged
+            make_file(Path::new("c.txt"), 30, 1000, Some(dummy_hash(3))), // will be modified
         ];
         let new = vec![
-            make_file(Path::new("b.txt"), 20, 1000, Some(dummy_hash(2))),  // unchanged
-            make_file(Path::new("c.txt"), 35, 2000, Some(dummy_hash(4))),  // modified
-            make_file(Path::new("d.txt"), 40, 3000, Some(dummy_hash(5))),  // added
+            make_file(Path::new("b.txt"), 20, 1000, Some(dummy_hash(2))), // unchanged
+            make_file(Path::new("c.txt"), 35, 2000, Some(dummy_hash(4))), // modified
+            make_file(Path::new("d.txt"), 40, 3000, Some(dummy_hash(5))), // added
         ];
 
         let root = PathBuf::from("/dummy");
@@ -620,13 +750,22 @@ mod tests {
         assert_eq!(summary.len(), 3);
 
         // Check each change (order follows sorted path merge-join)
-        assert_eq!(summary[0].0, &RelativePath::new(Path::new("a.txt")).unwrap());
+        assert_eq!(
+            summary[0].0,
+            &RelativePath::new(Path::new("a.txt")).unwrap()
+        );
         assert_eq!(summary[0].1, "R");
 
-        assert_eq!(summary[1].0, &RelativePath::new(Path::new("c.txt")).unwrap());
+        assert_eq!(
+            summary[1].0,
+            &RelativePath::new(Path::new("c.txt")).unwrap()
+        );
         assert_eq!(summary[1].1, "M");
 
-        assert_eq!(summary[2].0, &RelativePath::new(Path::new("d.txt")).unwrap());
+        assert_eq!(
+            summary[2].0,
+            &RelativePath::new(Path::new("d.txt")).unwrap()
+        );
         assert_eq!(summary[2].1, "A");
     }
 
@@ -645,7 +784,10 @@ mod tests {
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
-            assert!(!m.has_content, "Ownership change should not include content");
+            assert!(
+                !m.has_content,
+                "Ownership change should not include content"
+            );
             assert!(m.new_metadata.is_some());
         } else {
             panic!("Expected Modified change");
@@ -673,7 +815,14 @@ mod tests {
     fn test_large_scale_few_changes() {
         let count = 1000;
         let old: Vec<Entry> = (0..count)
-            .map(|i| make_file(Path::new(&format!("file_{:04}.txt", i)), 100, 1000, Some(dummy_hash(1))))
+            .map(|i| {
+                make_file(
+                    Path::new(&format!("file_{:04}.txt", i)),
+                    100,
+                    1000,
+                    Some(dummy_hash(1)),
+                )
+            })
             .collect();
 
         let mut new = old.clone();
@@ -689,16 +838,21 @@ mod tests {
         assert_eq!(changes.len(), 2);
 
         // file_0042: content changed
-        assert_eq!(changes[0].path, RelativePath::new(Path::new("file_0042.txt")).unwrap());
+        assert_eq!(
+            changes[0].path,
+            RelativePath::new(Path::new("file_0042.txt")).unwrap()
+        );
         if let ChangeKind::Modified(ref m) = changes[0].kind {
             assert!(m.has_content);
         }
 
         // file_0999: metadata only
-        assert_eq!(changes[1].path, RelativePath::new(Path::new("file_0999.txt")).unwrap());
+        assert_eq!(
+            changes[1].path,
+            RelativePath::new(Path::new("file_0999.txt")).unwrap()
+        );
         if let ChangeKind::Modified(ref m) = changes[1].kind {
             assert!(!m.has_content);
         }
     }
-
 }

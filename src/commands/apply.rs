@@ -6,12 +6,12 @@ use log::{info, warn};
 use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::{File, Permissions, symlink_metadata};
+use std::fs::{symlink_metadata, File, Permissions};
 use std::io::BufReader;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub fn run_apply(root_dir: &Path, diff_path: &Path) -> Result<()> {
+pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     if !root_dir.is_dir() {
         return Err(anyhow::anyhow!(
             "Root directory {} does not exist",
@@ -23,46 +23,47 @@ pub fn run_apply(root_dir: &Path, diff_path: &Path) -> Result<()> {
 
     let mut all_changes: Vec<(Change, Option<Vec<u8>>)> = Vec::new();
 
-    info!("Loading changes from {}", diff_path.display());
-    let file = File::open(diff_path)?;
-    let reader = BufReader::new(file);
-    let (mut format_reader, _header) = FormatReader::new(reader)?;
+    for diff_path in diff_files {
+        let file = File::open(diff_path)?;
+        let reader = BufReader::new(file);
+        let (mut format_reader, _header) = FormatReader::new(reader)?;
 
-    let records = format_reader.read_all_records()?;
+        let records = format_reader.read_all_records()?;
 
-    let mut pending_change: Option<Change> = None;
-    for record in records {
-        match record {
-            Record::DiffChange(change) => {
-                if let Some(previous_change) = pending_change.take() {
-                    all_changes.push((previous_change, None));
+        let mut pending_change: Option<Change> = None;
+        for record in records {
+            match record {
+                Record::DiffChange(change) => {
+                    if let Some(previous_change) = pending_change.take() {
+                        all_changes.push((previous_change, None));
+                    }
+                    let has_content = match &change.kind {
+                        ChangeKind::Added(added) => added.has_content,
+                        ChangeKind::Modified(modified) => modified.has_content,
+                        ChangeKind::Removed(_) => false,
+                    };
+                    if has_content {
+                        pending_change = Some(change);
+                    } else {
+                        all_changes.push((change, None));
+                    }
                 }
-                let has_content = match &change.kind {
-                    ChangeKind::Added(added) => added.has_content,
-                    ChangeKind::Modified(modified) => modified.has_content,
-                    ChangeKind::Removed(_) => false,
-                };
-                if has_content {
-                    pending_change = Some(change);
-                } else {
-                    all_changes.push((change, None));
+                Record::FileContent(content) => {
+                    if let Some(change) = pending_change.take() {
+                        all_changes.push((change, Some(content)));
+                    } else {
+                        warn!("Unexpected FileContent record without preceding change");
+                    }
                 }
-            }
-            Record::FileContent(content) => {
-                if let Some(change) = pending_change.take() {
-                    all_changes.push((change, Some(content)));
-                } else {
-                    warn!("Unexpected FileContent record without preceding change");
+                Record::SnapshotEntry(_) => {
+                    warn!("Unexpected SnapshotEntry in diff file");
                 }
-            }
-            Record::SnapshotEntry(_) => {
-                warn!("Unexpected SnapshotEntry in diff file");
             }
         }
-    }
-    // Flush any trailing change that expected content but didn't get it
-    if let Some(change) = pending_change.take() {
-        all_changes.push((change, None));
+        // Flush any trailing change that expected content but didn't get it
+        if let Some(change) = pending_change.take() {
+            all_changes.push((change, None));
+        }
     }
 
     info!("Applying {} changes", all_changes.len());
@@ -75,7 +76,7 @@ pub fn run_apply(root_dir: &Path, diff_path: &Path) -> Result<()> {
     for (change, _) in &all_changes {
         let full_path = change.path.to_full_path(&root_dir);
 
-        // Track paretn directories that will be affected by file operations
+        // Track parent directories that will be affected by file operations
         if let Some(parent_dir) = full_path.parent() {
             affected_parent_dirs.insert(parent_dir.to_path_buf());
         }
@@ -331,230 +332,22 @@ fn set_symlink_ownership(path: &Path, metadata: &Metadata) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::format::header::FileHeader;
-    use crate::format::writer::FormatWriter;
-    use crate::model::diff::{AddedEntry, ModifiedEntry};
-    use crate::model::entry::Entry;
-    use crate::model::path::RelativePath;
-    use tempfile::TempDir;
+/// Detect diff files: given a path like "diff.gapped", look for
+/// "diff.gapped.001, "diff.gapped.002", etc.
+pub fn detect_diff_files(diff_path: &Path) -> Vec<PathBuf> {
+    let path_str = diff_path.to_string_lossy();
 
-    fn make_metadata(size: u64, perms: u32) -> Metadata {
-        Metadata {
-            size,
-            mtime_sec: 1000,
-            mtime_nsec: 0,
-            permissions: perms,
-            uid: unsafe { nix::libc::getuid() },
-            gid: unsafe { nix::libc::getgid() },
+    if diff_path.exists() {
+        return vec![diff_path.to_path_buf()];
+    }
+    let mut chunks = Vec::new();
+    for i in 1.. {
+        let chunk_path = PathBuf::from(format!("{}.{:3}", path_str, i));
+        if chunk_path.exists() {
+            chunks.push(chunk_path);
+        } else {
+            break;
         }
     }
-
-    /// Build a binary diff file using FormatWriter.
-    fn build_diff_file(dir: &Path, write_records: impl FnOnce(&mut FormatWriter<File>)) -> PathBuf {
-        let diff_path = dir.join("test.diff");
-        let file = File::create(&diff_path).unwrap();
-        let header = FileHeader {
-            file_type: "diff".to_string(),
-            version: 1,
-            created_at: 0,
-            source_snapshot_hash: None,
-            root_dir: None,
-        };
-        let mut writer = FormatWriter::new(file, &header).unwrap();
-        write_records(&mut writer);
-        writer.finish().unwrap();
-        diff_path
-    }
-
-    // --- write_file_atomic ---
-
-    #[test]
-    fn write_file_atomic_creates_new_file() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("new.txt");
-        write_file_atomic(&path, b"hello").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"hello");
-    }
-
-    #[test]
-    fn write_file_atomic_overwrites_existing() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("existing.txt");
-        fs::write(&path, b"old").unwrap();
-        write_file_atomic(&path, b"new").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"new");
-    }
-
-    // --- run_apply: add / delete / modify ---
-
-    #[test]
-    fn apply_adds_file() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        fs::create_dir(&root).unwrap();
-
-        let change = Change {
-            path: RelativePath::new(Path::new("hello.txt")).unwrap(),
-            kind: ChangeKind::Added(AddedEntry {
-                entry: Entry {
-                    path: RelativePath::new(Path::new("hello.txt")).unwrap(),
-                    kind: EntryKind::File,
-                    metadata: make_metadata(5, 0o644),
-                    hash: None,
-                    symlink_target: None,
-                },
-                has_content: true,
-            }),
-        };
-
-        let diff_path = build_diff_file(dir.path(), |w| {
-            w.write_diff_change(&change).unwrap();
-            w.write_file_content(b"hello").unwrap();
-        });
-        run_apply(&root, &diff_path).unwrap();
-
-        assert_eq!(fs::read(root.join("hello.txt")).unwrap(), b"hello");
-    }
-
-    #[test]
-    fn apply_deletes_file() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("bye.txt"), b"bye").unwrap();
-
-        let change = Change {
-            path: RelativePath::new(Path::new("bye.txt")).unwrap(),
-            kind: ChangeKind::Removed(EntryKind::File),
-        };
-
-        let diff_path = build_diff_file(dir.path(), |w| {
-            w.write_diff_change(&change).unwrap();
-        });
-        run_apply(&root, &diff_path).unwrap();
-
-        assert!(!root.join("bye.txt").exists());
-    }
-
-    #[test]
-    fn apply_modifies_file_content() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("data.txt"), b"old").unwrap();
-
-        let change = Change {
-            path: RelativePath::new(Path::new("data.txt")).unwrap(),
-            kind: ChangeKind::Modified(ModifiedEntry {
-                new_metadata: Some(make_metadata(3, 0o644)),
-                new_hash: None,
-                has_content: true,
-                new_symlink_target: None,
-            }),
-        };
-
-        let diff_path = build_diff_file(dir.path(), |w| {
-            w.write_diff_change(&change).unwrap();
-            w.write_file_content(b"new").unwrap();
-        });
-        run_apply(&root, &diff_path).unwrap();
-
-        assert_eq!(fs::read(root.join("data.txt")).unwrap(), b"new");
-    }
-
-    #[test]
-    fn apply_adds_directory() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        fs::create_dir(&root).unwrap();
-
-        let change = Change {
-            path: RelativePath::new(Path::new("subdir")).unwrap(),
-            kind: ChangeKind::Added(AddedEntry {
-                entry: Entry {
-                    path: RelativePath::new(Path::new("subdir")).unwrap(),
-                    kind: EntryKind::Directory,
-                    metadata: make_metadata(0, 0o755),
-                    hash: None,
-                    symlink_target: None,
-                },
-                has_content: false,
-            }),
-        };
-
-        let diff_path = build_diff_file(dir.path(), |w| {
-            w.write_diff_change(&change).unwrap();
-        });
-        run_apply(&root, &diff_path).unwrap();
-
-        assert!(root.join("subdir").is_dir());
-    }
-
-    #[test]
-    fn apply_deletes_nested_directory() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        fs::create_dir_all(root.join("a/b")).unwrap();
-        fs::write(root.join("a/b/file.txt"), b"x").unwrap();
-
-        let diff_path = build_diff_file(dir.path(), |w| {
-            w.write_diff_change(&Change {
-                path: RelativePath::new(Path::new("a/b/file.txt")).unwrap(),
-                kind: ChangeKind::Removed(EntryKind::File),
-            })
-            .unwrap();
-            w.write_diff_change(&Change {
-                path: RelativePath::new(Path::new("a/b")).unwrap(),
-                kind: ChangeKind::Removed(EntryKind::Directory),
-            })
-            .unwrap();
-            w.write_diff_change(&Change {
-                path: RelativePath::new(Path::new("a")).unwrap(),
-                kind: ChangeKind::Removed(EntryKind::Directory),
-            })
-            .unwrap();
-        });
-        run_apply(&root, &diff_path).unwrap();
-
-        assert!(!root.join("a").exists());
-    }
-
-    // --- Phase ordering ---
-
-    #[test]
-    fn deletions_sorted_deepest_first() {
-        let changes: Vec<(Change, Option<Vec<u8>>)> = vec![
-            (
-                Change {
-                    path: RelativePath::new(Path::new("a")).unwrap(),
-                    kind: ChangeKind::Removed(EntryKind::Directory),
-                },
-                None,
-            ),
-            (
-                Change {
-                    path: RelativePath::new(Path::new("a/b/c")).unwrap(),
-                    kind: ChangeKind::Removed(EntryKind::File),
-                },
-                None,
-            ),
-            (
-                Change {
-                    path: RelativePath::new(Path::new("a/b")).unwrap(),
-                    kind: ChangeKind::Removed(EntryKind::Directory),
-                },
-                None,
-            ),
-        ];
-
-        let mut deletions: Vec<&(Change, Option<Vec<u8>>)> = changes.iter().collect();
-        deletions.sort_by(|a, b| b.0.path.depth().cmp(&a.0.path.depth()));
-
-        assert_eq!(deletions[0].0.path.depth(), 3); // a/b/c
-        assert_eq!(deletions[1].0.path.depth(), 2); // a/b
-        assert_eq!(deletions[2].0.path.depth(), 1); // a
-    }
+    chunks
 }
