@@ -51,7 +51,15 @@ fn main() {
             root_dir,
             diff_file,
             snapshot_file,
-        } => run_verify(&root_dir, &diff_file, &snapshot_file),
+        } => {
+            let diff_files = detect_diff_files(&diff_file);
+            if diff_files.is_empty() {
+                eprintln!("Error: No diff files(s) found at {}", diff_file.display());
+                std::process::exit(1);
+            }
+            let diff_refs: Vec<&std::path::Path> = diff_files.iter().map(|p| p.as_path()).collect();
+            run_verify(&root_dir, &diff_refs, &snapshot_file)
+        }
     };
 
     if let Err(e) = result {

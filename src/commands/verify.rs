@@ -14,7 +14,7 @@ use std::path::Path;
 /// Execute the verify command.
 /// Simulates applying the diff to the current filesystem state and checks the result
 /// against the target snapshot.
-pub fn run_verify(root_dir: &Path, diff_file: &Path, snapshot_path: &Path) -> Result<()> {
+pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -> Result<()> {
     if !root_dir.is_dir() {
         return Err(anyhow::anyhow!(
             "Root directory {} does not exist",
@@ -39,16 +39,18 @@ pub fn run_verify(root_dir: &Path, diff_file: &Path, snapshot_path: &Path) -> Re
     // Load and parse all diff changes
     let mut all_changes: Vec<Change> = Vec::new();
 
-    info!("Loading diff from {}", diff_file.display());
-    let file = File::open(diff_file)?;
-    let reader = BufReader::new(file);
-    let (mut format_reader, _header) = FormatReader::new(reader)?;
+    for diff_path in diff_files {
+        info!("Loading diff from {}", diff_path.display());
+        let file = File::open(diff_path)?;
+        let reader = BufReader::new(file);
+        let (mut format_reader, _header) = FormatReader::new(reader)?;
 
-    let records = format_reader.read_all_records()?;
+        let records = format_reader.read_all_records()?;
 
-    for record in records {
-        if let Record::DiffChange(change) = record {
-            all_changes.push(change);
+        for record in records {
+            if let Record::DiffChange(change) = record {
+                all_changes.push(change);
+            }
         }
     }
 
