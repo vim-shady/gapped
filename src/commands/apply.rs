@@ -342,7 +342,7 @@ pub fn detect_diff_files(diff_path: &Path) -> Vec<PathBuf> {
     }
     let mut chunks = Vec::new();
     for i in 1.. {
-        let chunk_path = PathBuf::from(format!("{}.{:3}", path_str, i));
+        let chunk_path = PathBuf::from(format!("{}.{:03}", path_str, i));
         if chunk_path.exists() {
             chunks.push(chunk_path);
         } else {
@@ -350,4 +350,165 @@ pub fn detect_diff_files(diff_path: &Path) -> Vec<PathBuf> {
         }
     }
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::diff::run_diff;
+    use crate::commands::snapshot::run_snapshot;
+    use std::fs::{self, File};
+    use tempfile::TempDir;
+
+    fn copy_dir_tree(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                copy_dir_tree(&src_path, &dst_path);
+            } else if file_type.is_file() {
+                fs::copy(&src_path, &dst_path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_diff_files_single_file() {
+        let tmp = TempDir::new().unwrap();
+        let diff_path = tmp.path().join("diff.gapped");
+        File::create(&diff_path).unwrap();
+
+        let chunks = detect_diff_files(&diff_path);
+        assert_eq!(chunks, vec![diff_path]);
+    }
+
+    #[test]
+    fn test_detect_diff_files_split_chunksd() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("diff.gapped");
+        File::create(tmp.path().join("diff.gapped.001")).unwrap();
+        File::create(tmp.path().join("diff.gapped.002")).unwrap();
+        File::create(tmp.path().join("diff.gapped.003")).unwrap();
+
+        let chunks = detect_diff_files(&base);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], tmp.path().join("diff.gapped.001"));
+        assert_eq!(chunks[1], tmp.path().join("diff.gapped.002"));
+        assert_eq!(chunks[2], tmp.path().join("diff.gapped.003"));
+    }
+
+    #[test]
+    fn test_detect_diff_files_none_() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("diff.gapped");
+        let chunks = detect_diff_files(&base);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_detect_diff_files_stops_at_gap() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("diff.gapped");
+        File::create(tmp.path().join("diff.gapped.001")).unwrap();
+        File::create(tmp.path().join("diff.gapped.002")).unwrap();
+        // gap
+        File::create(tmp.path().join("diff.gapped.004")).unwrap();
+
+        let chunks = detect_diff_files(&base);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], tmp.path().join("diff.gapped.001"));
+        assert_eq!(chunks[1], tmp.path().join("diff.gapped.002"));
+    }
+
+    // E2E: snapshot → diff with split_size → apply the detected chunks
+    #[test]
+    fn test_run_apply_from_split_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir(&source).unwrap();
+
+        // create enough files to generate multiple chunks under a small split size
+        for i in 0..12 {
+            fs::write(source.join(format!("file_{:02}.txt", i)), vec![b'a'; 1024]).unwrap();
+        }
+
+        copy_dir_tree(&source, &target);
+
+        // initila snapshot
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        // modify every file
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for i in 0..12 {
+            fs::write(source.join(format!("file_{:02}.txt", i)), vec![b'b'; 2048]).unwrap();
+        }
+        // add one, remove one
+        fs::write(source.join("new.txt"), b"brand new\n").unwrap();
+        fs::remove_file(source.join("file_00.txt")).unwrap();
+
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, Some(4096), false).unwrap();
+
+        let chunks = detect_diff_files(&diff_base);
+        assert!(
+            chunks.len() > 1,
+            "expected more than one chunk, got {}",
+            chunks.len()
+        );
+
+        // Apply
+        let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
+        run_apply(&target, &chunk_refs).unwrap();
+
+        // Validate
+        assert!(!target.join("file_00.txt").exists());
+        assert_eq!(fs::read(target.join("new.txt")).unwrap(), b"brand new\n");
+        for i in 1..12 {
+            let content = fs::read(target.join(format!("file_{:02}.txt", i))).unwrap();
+            assert_eq!(content, vec![b'b'; 2048]);
+        }
+    }
+
+    #[test]
+    fn test_run_apply_from_compressed_split_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir(&source).unwrap();
+
+        for i in 0..8 {
+            fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'x'; 2048]).unwrap();
+        }
+
+        copy_dir_tree(&source, &target);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        for i in 0..8 {
+            fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'y'; 2048]).unwrap();
+        }
+
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), true).unwrap();
+
+        let chunks = detect_diff_files(&diff_base);
+        assert!(chunks.len() > 1);
+
+        let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
+        run_apply(&target, &chunk_refs).unwrap();
+
+        for i in 0..8 {
+            let content = fs::read(target.join(format!("f_{:02}.bin", i))).unwrap();
+            assert_eq!(content, vec![b'y'; 2048]);
+        }
+    }
 }

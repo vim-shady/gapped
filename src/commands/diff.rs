@@ -340,7 +340,7 @@ fn compute_diff(
 fn compute_entry_diff(old: &Entry, new: &Entry) -> Option<Change> {
     debug_assert!(old.kind == new.kind);
 
-    let metadata_changed = old.metadata != new.metadata;
+    let metadata_changed = !old.metadata.matches(&new.metadata);
     let hash_changed = old.hash != new.hash;
     let symlink_target_changed = old.symlink_target != new.symlink_target;
 
@@ -809,6 +809,183 @@ mod tests {
         } else {
             panic!("Expected Modified change");
         }
+    }
+
+    // --- Split diff writer tests ---
+
+    use crate::commands::apply::detect_diff_files;
+    use crate::commands::snapshot::run_snapshot;
+    use crate::format::reader::{FormatReader, Record};
+    use std::fs;
+    use std::io::BufReader;
+    use tempfile::TempDir;
+
+    // count change records across diff files
+    fn count_diff_changes(chunks: &[PathBuf]) -> usize {
+        let mut total = 0;
+        for chunk in chunks {
+            let file = File::open(chunk).unwrap();
+            let reader = BufReader::new(file);
+            let (mut fr, _header) = FormatReader::new(reader).unwrap();
+            for record in fr.read_all_records().unwrap() {
+                if matches!(record, Record::DiffChange(_)) {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    // seed source dir with files and write payloaf
+    fn seed_source(source: &Path, count: usize, payload: &[u8]) {
+        fs::create_dir_all(source).unwrap();
+        for i in 0..count {
+            fs::write(source.join(format!("f_{:03}.dat", i)), payload).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_run_diff_writes_single_file() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src");
+        seed_source(&source, 3, b"hello");
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        fs::write(source.join("f_000.dat"), b"updated").unwrap();
+
+        let diff = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff, &snap2, None, false).unwrap();
+
+        assert!(diff.exists(), "single diff file should be written");
+        assert!(
+            !tmp.path().join("diff.gapped.001").exists(),
+            "no chunk file should be created without split_size"
+        );
+    }
+
+    #[test]
+    fn test_run_diff_with_split_produces_multiple_files() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src");
+        seed_source(&source, 10, &vec![b'a'; 1024]);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        // modify every file so the diff contains changes for every file
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for i in 0..10 {
+            fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'b'; 2048]).unwrap();
+        }
+
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, Some(4096), false).unwrap();
+
+        // base path itself should NOT exist...
+        assert!(!diff_base.exists());
+
+        let chunks = detect_diff_files(&diff_base);
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let expected = tmp.path().join(format!("diff.gapped.{:03}", i + 1));
+            assert_eq!(chunk, &expected);
+        }
+    }
+
+    #[test]
+    fn test_run_diff_split_preserves_all_changes() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src");
+        seed_source(&source, 15, &vec![b'a'; 512]);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        // 15 modifications + 1 addition + 1 removal = 17 changes
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for i in 0..15 {
+            fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'b'; 1024]).unwrap();
+        }
+        fs::write(source.join("extra.txt"), b"new").unwrap();
+        fs::remove_file(source.join("f_000.dat")).unwrap();
+
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), false).unwrap();
+
+        let chunks = detect_diff_files(&diff_base);
+        assert!(chunks.len() > 1);
+
+        // 14 modified files (f_001..f_014) + 1 added + 1 removed + 1 modified
+        // root dir (its mtime changes when files are added/removed) = 17.
+        // (f_000 was rewritten then deleted → single Removed change.)
+        let total_changes = count_diff_changes(&chunks);
+        assert_eq!(total_changes, 17);
+    }
+
+    #[test]
+    fn test_run_diff_split_chunk_headers_have_chunk_index() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src");
+        seed_source(&source, 6, &vec![b'a'; 1024]);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for i in 0..6 {
+            fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'z'; 2048]).unwrap();
+        }
+
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, Some(3072), false).unwrap();
+
+        let chunks = detect_diff_files(&diff_base);
+        assert!(chunks.len() > 1);
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let file = File::open(chunk).unwrap();
+            let (_, header) = FormatReader::new(BufReader::new(file)).unwrap();
+            assert_eq!(header.file_type, "diff");
+            assert_eq!(header.chunk_index, Some(i as u32));
+            assert!(header.source_snapshot_hash.is_some());
+        }
+    }
+
+    #[test]
+    fn test_run_diff_split_compressed() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src");
+        seed_source(&source, 8, &vec![b'a'; 1024]);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for i in 0..8 {
+            fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'c'; 2048]).unwrap();
+        }
+
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), true).unwrap();
+
+        let chunks = detect_diff_files(&diff_base);
+        assert!(chunks.len() > 1);
+
+        let total = count_diff_changes(&chunks);
+        assert_eq!(total, 8);
     }
 
     #[test]

@@ -98,7 +98,7 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
                     );
                     discrepancies += 1;
                 }
-                if simulated_entry.metadata != target_entry.metadata {
+                if !simulated_entry.metadata.matches(&target_entry.metadata) {
                     eprintln!("METADATA MISMATCH: {}", path);
                     eprintln!("  simulated: {:?}", simulated_entry.metadata);
                     eprintln!("  target:    {:?}", target_entry.metadata);
@@ -130,5 +130,132 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
     } else {
         eprintln!("Verify failed: {} discrepancies found", discrepancies);
         Err(anyhow::anyhow!("Verify failed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::apply::detect_diff_files;
+    use crate::commands::diff::run_diff;
+    use crate::commands::snapshot::run_snapshot;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        use nix::sys::stat::UtimensatFlags;
+        use nix::sys::time::TimeSpec;
+        use std::os::unix::fs::MetadataExt;
+
+        fn set_mtime_from(path: &Path, src_meta: &fs::Metadata) {
+            let atime = TimeSpec::UTIME_OMIT;
+            let mtime = TimeSpec::new(src_meta.mtime(), src_meta.mtime_nsec() as i64);
+            nix::sys::stat::utimensat(
+                None,
+                path,
+                &atime,
+                &mtime,
+                UtimensatFlags::NoFollowSymlink,
+            )
+            .unwrap();
+        }
+
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            let ft = entry.file_type().unwrap();
+            if ft.is_dir() {
+                copy_tree(&src_path, &dst_path);
+            } else if ft.is_file() {
+                fs::copy(&src_path, &dst_path).unwrap();
+                let m = fs::metadata(&src_path).unwrap();
+                set_mtime_from(&dst_path, &m);
+            }
+        }
+        // set the directory's mtime last
+        let src_meta = fs::metadata(src).unwrap();
+        set_mtime_from(dst, &src_meta);
+    }
+
+    // build a scenario with split diff chunks and return the pieces needed for verify.
+    fn build_split_scenario(tmp: &TempDir) -> (PathBuf, Vec<PathBuf>, PathBuf) {
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir(&source).unwrap();
+
+        // seed source
+        for i in 0..8 {
+            fs::write(source.join(format!("f_{:02}.txt", i)), vec![b'a'; 1024]).unwrap();
+        }
+
+        // target is a copy of the initial source
+        copy_tree(&source, &target);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        // modify source
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for i in 0..8 {
+            fs::write(source.join(format!("f_{:02}.txt", i)), vec![b'b'; 2048]).unwrap();
+        }
+
+        // small split size -> multiple chunks
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, Some(3072), false).unwrap();
+
+        let chunks = detect_diff_files(&diff_base);
+        assert!(chunks.len() > 1, "expected split chunks");
+
+        (target, chunks, snap2)
+    }
+
+    #[test]
+    fn test_run_verify_with_split_chunks_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let (target, chunks, snap2) = build_split_scenario(&tmp);
+
+        let chunk_refs: Vec<&Path> = chunks.iter().map(|p: &PathBuf| p.as_path()).collect();
+        // Applying these chunks to `target` (currently == original source)
+        // should yield the state captured in snap2.
+        run_verify(&target, &chunk_refs, &snap2).expect("verify should succeed");
+    }
+
+    #[test]
+    fn test_run_verify_detects_discrepancy_from_split_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let (target, chunks, snap2) = build_split_scenario(&tmp);
+
+        fs::write(target.join("extra.txt"), b"unexpected").unwrap();
+
+        let chunk_refs: Vec<&Path> = chunks.iter().map(|p: &PathBuf| p.as_path()).collect();
+        let result = run_verify(&target, &chunk_refs, &snap2);
+        assert!(result.is_err(), "verify should fail on discrepancy");
+    }
+
+    #[test]
+    fn test_run_verify_single_diff_still_works() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("only.txt"), b"v1").unwrap();
+        copy_tree(&source, &target);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(source.join("only.txt"), b"v2-longer").unwrap();
+
+        let diff = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff, &snap2, None, false).unwrap();
+
+        run_verify(&target, &[diff.as_path()], &snap2).expect("single-file verify should pass");
     }
 }
