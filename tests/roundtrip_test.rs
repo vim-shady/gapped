@@ -305,13 +305,6 @@ fn test_iterative_sync() {
         snap3.to_str().unwrap(),
     ]));
     assert!(run_gapped(&[
-        "diff",
-        fixture.target().to_str().unwrap(),
-        snap2.to_str().unwrap(),
-        diff2.to_str().unwrap(),
-        snap3.to_str().unwrap(),
-    ]));
-    assert!(run_gapped(&[
         "apply",
         fixture.target().to_str().unwrap(),
         diff2.to_str().unwrap(),

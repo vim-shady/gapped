@@ -48,7 +48,7 @@ impl TestFixture {
     pub fn verify_rsync_identical(&self) -> bool {
         let output = Command::new("rsync")
             .args([
-                "-a",
+                "-avn", "--delete", "--checksum",
                 &format!("{}/", self.source().display()),
                 &format!("{}/", self.target().display()),
             ])
@@ -62,6 +62,7 @@ impl TestFixture {
             .filter(|line| !line.starts_with("sending"))
             .filter(|line| !line.starts_with("total size"))
             .filter(|line| !line.starts_with("sent"))
+            .filter(|line| line.trim() != "./")
             .collect();
         lines.is_empty()
     }
