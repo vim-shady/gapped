@@ -1,3 +1,4 @@
+use rayon::iter::ParallelIterator;
 use crate::fs::hash::hash_file;
 use crate::fs::metadata::collect_metadata;
 use crate::model::entry::{Entry, EntryKind};
@@ -6,6 +7,7 @@ use anyhow::Result;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::path::Path;
+use rayon::iter::IntoParallelRefIterator;
 use walkdir::WalkDir;
 
 /// Statistics from single filesystem walk.
@@ -95,7 +97,7 @@ pub fn walk_filesystem(
     // Compute hashes for files
     let root_owned = root.to_path_buf();
     let entries: Vec<Option<Entry>> = raw_entries
-        .iter() // Todo: parallelize
+        .par_iter()
         .map(|(rel_path, kind, metadata, link_target)| {
             let hash = if *kind == EntryKind::File {
                 // Check if we can reuse an old hash
