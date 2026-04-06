@@ -331,22 +331,31 @@ fn set_symlink_ownership(path: &Path, metadata: &Metadata) {
 
 /// Detect diff files: given a path like "diff.gapped", look for
 /// "diff.gapped.001, "diff.gapped.002", etc.
-pub fn detect_diff_files(diff_path: &Path) -> Vec<PathBuf> {
+pub fn detect_diff_files(diff_path: &Path) -> Result<Vec<PathBuf>> {
     let path_str = diff_path.to_string_lossy();
 
     if diff_path.exists() {
-        return vec![diff_path.to_path_buf()];
+        return Ok(vec![diff_path.to_path_buf()]);
     }
     let mut chunks = Vec::new();
-    for i in 1.. {
+    let mut i = 1u32;
+    loop {
         let chunk_path = PathBuf::from(format!("{}.{:03}", path_str, i));
         if chunk_path.exists() {
             chunks.push(chunk_path);
+            i += 1;
         } else {
             break;
         }
     }
-    chunks
+    let after_gap = PathBuf::from(format!("{}.{:03}", path_str, i + 1));
+    if after_gap.exists() {
+        return Err(GappedError::InvalidFormat(format!(
+            "Diff chunk sequence has a gap: {}.{:03} is missing but {}.{:03} exists",
+            path_str, i, path_str, i + 1,
+        )));
+    }
+    Ok(chunks)
 }
 
 #[cfg(test)]
@@ -378,19 +387,19 @@ mod tests {
         let diff_path = tmp.path().join("diff.gapped");
         File::create(&diff_path).unwrap();
 
-        let chunks = detect_diff_files(&diff_path);
+        let chunks = detect_diff_files(&diff_path).unwrap();
         assert_eq!(chunks, vec![diff_path]);
     }
 
     #[test]
-    fn test_detect_diff_files_split_chunksd() {
+    fn test_detect_diff_files_split_chunks() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("diff.gapped");
         File::create(tmp.path().join("diff.gapped.001")).unwrap();
         File::create(tmp.path().join("diff.gapped.002")).unwrap();
         File::create(tmp.path().join("diff.gapped.003")).unwrap();
 
-        let chunks = detect_diff_files(&base);
+        let chunks = detect_diff_files(&base).unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], tmp.path().join("diff.gapped.001"));
         assert_eq!(chunks[1], tmp.path().join("diff.gapped.002"));
@@ -398,26 +407,24 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_diff_files_none_() {
+    fn test_detect_diff_files_none() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("diff.gapped");
-        let chunks = detect_diff_files(&base);
+        let chunks = detect_diff_files(&base).unwrap();
         assert!(chunks.is_empty());
     }
 
     #[test]
-    fn test_detect_diff_files_stops_at_gap() {
+    fn test_detect_diff_files_errors_on_gap() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("diff.gapped");
         File::create(tmp.path().join("diff.gapped.001")).unwrap();
         File::create(tmp.path().join("diff.gapped.002")).unwrap();
-        // gap
+        // gap: .003 missing
         File::create(tmp.path().join("diff.gapped.004")).unwrap();
 
-        let chunks = detect_diff_files(&base);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], tmp.path().join("diff.gapped.001"));
-        assert_eq!(chunks[1], tmp.path().join("diff.gapped.002"));
+        let result = detect_diff_files(&base);
+        assert!(result.is_err(), "should error on gap in chunk sequence");
     }
 
     // E2E: snapshot → diff with split_size → apply the detected chunks
@@ -452,7 +459,7 @@ mod tests {
         let snap2 = tmp.path().join("snap2");
         run_diff(&source, &snap1, &diff_base, &snap2, Some(4096), false).unwrap();
 
-        let chunks = detect_diff_files(&diff_base);
+        let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(
             chunks.len() > 1,
             "expected more than one chunk, got {}",
@@ -497,7 +504,7 @@ mod tests {
         let snap2 = tmp.path().join("snap2");
         run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), true).unwrap();
 
-        let chunks = detect_diff_files(&diff_base);
+        let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1);
 
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();

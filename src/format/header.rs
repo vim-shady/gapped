@@ -44,7 +44,6 @@ pub struct FileHeader {
     pub source_snapshot_hash: Option<[u8; 32]>,
     /// For snapshots: informational root directory
     pub root_dir: Option<String>,
-    /// For split diffs: chunk index (0-based)
+    /// For split diffs: chunk number (1-based, matches filename suffix)
     pub chunk_index: Option<u32>,
-    pub more_chunks: Option<bool>,
 }

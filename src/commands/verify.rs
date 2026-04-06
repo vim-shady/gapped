@@ -199,7 +199,7 @@ mod tests {
         let snap2 = tmp.path().join("snap2");
         run_diff(&source, &snap1, &diff_base, &snap2, Some(3072), false).unwrap();
 
-        let chunks = detect_diff_files(&diff_base);
+        let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1, "expected split chunks");
 
         (target, chunks, snap2)

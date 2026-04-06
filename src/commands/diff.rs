@@ -116,7 +116,6 @@ fn write_snapshot(
         source_snapshot_hash: None,
         root_dir: Some(root_dir.to_string_lossy().into_owned()),
         chunk_index: None,
-        more_chunks: None,
     };
 
     let mut writer: FormatWriter<BufWriter<File>> = if compress {
@@ -143,11 +142,11 @@ fn write_split_diff(
     compress: bool,
 ) -> Result<()> {
     let diff_out_str = diff_out.to_string_lossy();
-    let mut chunk_index: u32 = 0;
+    let mut chunk_number: u32 = 1;
     let mut change_index = 0;
 
     while change_index < changes.len() {
-        let chunk_path = format!("{}.{:03}", diff_out_str, chunk_index + 1);
+        let chunk_path = format!("{}.{:03}", diff_out_str, chunk_number);
         let file = File::create(&chunk_path)?;
         let buf_writer = BufWriter::new(file);
 
@@ -160,8 +159,7 @@ fn write_split_diff(
                 .as_secs() as i64,
             source_snapshot_hash: Some(source_snapshot_hash),
             root_dir: None,
-            chunk_index: Some(chunk_index),
-            more_chunks: None,
+            chunk_index: Some(chunk_number),
         };
         let mut writer: FormatWriter<BufWriter<File>> = if compress {
             FormatWriter::new_compressed(buf_writer, &header)?
@@ -181,10 +179,10 @@ fn write_split_diff(
         }
 
         writer.finish()?;
-        chunk_index += 1;
+        chunk_number += 1;
     }
 
-    info!("Wrote {} diff chunks", chunk_index);
+    info!("Wrote {} diff chunks", chunk_number - 1);
     Ok(())
 }
 
@@ -208,7 +206,6 @@ fn write_single_diff(
         source_snapshot_hash: Some(source_snapshot_hash),
         root_dir: None,
         chunk_index: None,
-        more_chunks: None,
     };
 
     let mut writer = if compress {
@@ -865,7 +862,7 @@ mod tests {
         // base path itself should NOT exist...
         assert!(!diff_base.exists());
 
-        let chunks = detect_diff_files(&diff_base);
+        let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(
             chunks.len() > 1,
             "expected multiple chunks, got {}",
@@ -899,7 +896,7 @@ mod tests {
         let snap2 = tmp.path().join("snap2");
         run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), false).unwrap();
 
-        let chunks = detect_diff_files(&diff_base);
+        let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1);
 
         // 14 modified files (f_001..f_014) + 1 added + 1 removed + 1 modified
@@ -927,14 +924,14 @@ mod tests {
         let snap2 = tmp.path().join("snap2");
         run_diff(&source, &snap1, &diff_base, &snap2, Some(3072), false).unwrap();
 
-        let chunks = detect_diff_files(&diff_base);
+        let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1);
 
         for (i, chunk) in chunks.iter().enumerate() {
             let file = File::open(chunk).unwrap();
             let (_, header) = FormatReader::new(BufReader::new(file)).unwrap();
             assert_eq!(header.file_type, "diff");
-            assert_eq!(header.chunk_index, Some(i as u32));
+            assert_eq!(header.chunk_index, Some((i + 1) as u32));
             assert!(header.source_snapshot_hash.is_some());
         }
     }
@@ -957,7 +954,7 @@ mod tests {
         let snap2 = tmp.path().join("snap2");
         run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), true).unwrap();
 
-        let chunks = detect_diff_files(&diff_base);
+        let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1);
 
         let total = count_diff_changes(&chunks);
