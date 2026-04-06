@@ -345,7 +345,7 @@ fn compute_entry_diff(old: &Entry, new: &Entry) -> Option<Change> {
 fn build_removed_change(entry: &Entry) -> Change {
     Change {
         path: entry.path.clone(),
-        kind: ChangeKind::Removed(entry.kind.clone()),
+        kind: ChangeKind::Removed(entry.kind),
     }
 }
 

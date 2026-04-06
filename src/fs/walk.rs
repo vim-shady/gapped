@@ -4,8 +4,7 @@ use crate::fs::metadata::collect_metadata;
 use crate::model::entry::{Entry, EntryKind};
 use crate::model::path::RelativePath;
 use log::{info, warn};
-use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::ParallelIterator;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::HashMap;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -21,7 +20,6 @@ pub struct WalkStats {
     pub files_hash_reused: usize,
     pub errors: usize,
 }
-// TODO: Refactor this ugly creation...
 /// Walk the filesystem under 'root' and return a sorted list of entries
 pub fn walk_filesystem(
     root: &Path,
@@ -94,80 +92,83 @@ pub fn walk_filesystem(
         raw_entries.push((relative_path, kind, metadata, symlink_target));
     }
 
-    // Compute hashes for files
+    // Compute hashes for files in parallel, tracking hash outcome for stats
+    #[derive(Clone, Copy)]
+    enum HashOutcome {
+        Hashed,
+        Reused,
+        NotAFile,
+        Error,
+    }
+
     let root_owned = root.to_path_buf();
-    let entries: Vec<Option<Entry>> = raw_entries
+    let results: Vec<(Option<Entry>, HashOutcome)> = raw_entries
         .par_iter()
         .map(|(rel_path, kind, metadata, link_target)| {
-            let hash = if *kind == EntryKind::File {
-                // Check if we can reuse an old hash
-                if let Some(prev) = previous_entries {
-                    if let Some(prev_entry) = prev.get(rel_path) {
-                        if prev_entry.kind == EntryKind::File
-                            && prev_entry.metadata.size_and_mtime_match(metadata)
-                        {
-                            return Some(Entry {
+            if *kind != EntryKind::File {
+                return (
+                    Some(Entry {
+                        path: rel_path.clone(),
+                        kind: *kind,
+                        metadata: metadata.clone(),
+                        hash: None,
+                        symlink_target: link_target.clone(),
+                    }),
+                    HashOutcome::NotAFile,
+                );
+            }
+
+            // Check if we can reuse an old hash
+            if let Some(prev) = previous_entries {
+                if let Some(prev_entry) = prev.get(rel_path) {
+                    if prev_entry.kind == EntryKind::File
+                        && prev_entry.metadata.size_and_mtime_match(metadata)
+                    {
+                        return (
+                            Some(Entry {
                                 path: rel_path.clone(),
-                                kind: kind.clone(),
+                                kind: *kind,
                                 metadata: metadata.clone(),
                                 hash: prev_entry.hash,
                                 symlink_target: None,
-                            });
-                        }
+                            }),
+                            HashOutcome::Reused,
+                        );
                     }
                 }
+            }
 
-                let full_path = rel_path.to_full_path(&root_owned);
-                match hash_file(&full_path) {
-                    Ok(hash) => Some(hash),
-                    Err(e) => {
-                        warn!("Cannot hash {}: {}", full_path.display(), e);
-                        return None;
-                    }
+            let full_path = rel_path.to_full_path(&root_owned);
+            match hash_file(&full_path) {
+                Ok(hash) => (
+                    Some(Entry {
+                        path: rel_path.clone(),
+                        kind: *kind,
+                        metadata: metadata.clone(),
+                        hash: Some(hash),
+                        symlink_target: link_target.clone(),
+                    }),
+                    HashOutcome::Hashed,
+                ),
+                Err(e) => {
+                    warn!("Cannot hash {}: {}", full_path.display(), e);
+                    (None, HashOutcome::Error)
                 }
-            } else {
-                None
-            };
-
-            Some(Entry {
-                path: rel_path.clone(),
-                kind: kind.clone(),
-                metadata: metadata.clone(),
-                hash,
-                symlink_target: link_target.clone(),
-            })
+            }
         })
         .collect();
 
-    // Collect results, filtering out errors, count hash stats
-    let mut result_entries: Vec<Entry> = Vec::with_capacity(entries.len());
-    for (i, opt_entry) in entries.into_iter().enumerate() {
-        match opt_entry {
-            Some(entry) => {
-                if entry.kind == EntryKind::File {
-                    let (rel_path, _, metadata, _) = &raw_entries[i];
-                    // Determine if hash was reused
-                    if let Some(prev) = previous_entries {
-                        if let Some(prev_entry) = prev.get(rel_path) {
-                            if prev_entry.kind == EntryKind::File
-                                && prev_entry.metadata.size_and_mtime_match(metadata)
-                            {
-                                stats.files_hash_reused += 1;
-                            } else {
-                                stats.files_hashed += 1;
-                            }
-                        } else {
-                            stats.files_hashed += 1;
-                        }
-                    } else {
-                        stats.files_hashed += 1;
-                    }
-                }
-                result_entries.push(entry);
-            }
-            None => {
-                stats.errors += 1;
-            }
+    // Collect results and stats in a single pass
+    let mut result_entries: Vec<Entry> = Vec::with_capacity(results.len());
+    for (opt_entry, outcome) in results {
+        match outcome {
+            HashOutcome::Hashed => stats.files_hashed += 1,
+            HashOutcome::Reused => stats.files_hash_reused += 1,
+            HashOutcome::Error => stats.errors += 1,
+            HashOutcome::NotAFile => {}
+        }
+        if let Some(entry) = opt_entry {
+            result_entries.push(entry);
         }
     }
 
