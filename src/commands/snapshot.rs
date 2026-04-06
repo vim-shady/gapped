@@ -1,4 +1,4 @@
-use crate::error::{GappedError, Result};
+use crate::error::Result;
 use crate::format::header::FileHeader;
 use crate::format::reader::{FormatReader, Record};
 use crate::format::writer::FormatWriter;
@@ -53,12 +53,7 @@ pub fn run_snapshot(
     snapshot_in: Option<&Path>,
     compress: bool,
 ) -> Result<()> {
-    // Validate root_dir
-    if !root_dir.is_dir() {
-        return Err(GappedError::RootNotFound(root_dir.to_path_buf()));
-    }
-
-    let root_dir = root_dir.canonicalize()?;
+    let root_dir = super::validate_root_dir(root_dir)?;
 
     // Load previous snapshot if provided
     let previous_entries = if let Some(snapshot_in) = snapshot_in {
@@ -112,11 +107,4 @@ pub fn run_snapshot(
     }
 
     Ok(())
-}
-
-pub fn hash_snapshot_file(snapshot_path: &Path) -> Result<[u8; 32]> {
-    crate::fs::hash::hash_file(snapshot_path).map_err(|e| GappedError::IoPath {
-        path: snapshot_path.to_path_buf(),
-        source: e,
-    })
 }

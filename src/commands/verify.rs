@@ -15,11 +15,7 @@ use std::path::Path;
 /// Simulates applying the diff to the current filesystem state and checks the result
 /// against the target snapshot.
 pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -> Result<()> {
-    if !root_dir.is_dir() {
-        return Err(GappedError::RootNotFound(root_dir.to_path_buf()));
-    }
-
-    let root_dir = root_dir.canonicalize()?;
+    let root_dir = super::validate_root_dir(root_dir)?;
 
     info!("Loading snapshot from {}", snapshot_path.display());
     let (target_entries, _) = load_snapshot_entries(snapshot_path)?;

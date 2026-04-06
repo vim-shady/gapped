@@ -12,11 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
-    if !root_dir.is_dir() {
-        return Err(GappedError::RootNotFound(root_dir.to_path_buf()));
-    }
-
-    let root_dir = root_dir.canonicalize()?;
+    let root_dir = super::validate_root_dir(root_dir)?;
 
     let mut all_changes: Vec<(Change, Option<Vec<u8>>)> = Vec::new();
 
@@ -217,20 +213,13 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
                 }
 
                 if let Some(new_metadata) = &modified.new_metadata {
-                    let is_symlink = full_path
-                        .symlink_metadata()
-                        .map(|meta| meta.file_type().is_symlink())
-                        .unwrap_or(false);
-                    if is_symlink {
+                    let file_type = full_path.symlink_metadata().map(|m| m.file_type()).ok();
+                    if file_type.map_or(false, |ft| ft.is_symlink()) {
                         set_symlink_ownership(&full_path, new_metadata);
                         set_mtime(&full_path, new_metadata.mtime_sec, new_metadata.mtime_nsec);
                     } else {
-                        let is_dir = full_path
-                            .symlink_metadata()
-                            .map(|meta| meta.file_type().is_dir())
-                            .unwrap_or(false);
                         set_metadata(&full_path, new_metadata);
-                        if is_dir {
+                        if file_type.map_or(false, |ft| ft.is_dir()) {
                             dir_metadata_changes.push((change, new_metadata));
                         }
                     }
@@ -352,7 +341,10 @@ pub fn detect_diff_files(diff_path: &Path) -> Result<Vec<PathBuf>> {
     if after_gap.exists() {
         return Err(GappedError::InvalidFormat(format!(
             "Diff chunk sequence has a gap: {}.{:03} is missing but {}.{:03} exists",
-            path_str, i, path_str, i + 1,
+            path_str,
+            i,
+            path_str,
+            i + 1,
         )));
     }
     Ok(chunks)

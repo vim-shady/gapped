@@ -1,6 +1,4 @@
-use crate::commands::snapshot::hash_snapshot_file;
-use crate::error::GappedError;
-use crate::error::Result;
+use crate::error::{GappedError, Result};
 use crate::format::header::FileHeader;
 use crate::format::writer::FormatWriter;
 use crate::model::diff::{AddedEntry, Change, ChangeKind, Diff, ModifiedEntry};
@@ -20,16 +18,15 @@ pub fn run_diff(
     split_size: Option<u64>,
     compress: bool,
 ) -> Result<()> {
-    // Validate root dir
-    if !root_dir.is_dir() {
-        return Err(GappedError::RootNotFound(root_dir.to_path_buf()));
-    }
-
-    let root_dir = root_dir.canonicalize()?;
+    let root_dir = super::validate_root_dir(root_dir)?;
 
     // Compute hash of input snapshot
     info!("Hashing input snapshot {}", snapshot_in.display());
-    let source_snapshot_hash = hash_snapshot_file(snapshot_in)?;
+    let source_snapshot_hash =
+        crate::fs::hash::hash_file(snapshot_in).map_err(|e| GappedError::IoPath {
+            path: snapshot_in.to_path_buf(),
+            source: e,
+        })?;
 
     // Load the input snapshot
     info!("Loading input snapshot {}", snapshot_in.display());
@@ -46,18 +43,14 @@ pub fn run_diff(
     info!("Computing diff");
     let changes = compute_diff(&old_entries, &new_entries, &root_dir)?;
 
-    let added_count = changes
-        .iter()
-        .filter(|change| matches!(change.kind, ChangeKind::Added(_)))
-        .count();
-    let modified_count = changes
-        .iter()
-        .filter(|change| matches!(change.kind, ChangeKind::Modified(_)))
-        .count();
-    let removed_count = changes
-        .iter()
-        .filter(|change| matches!(change.kind, ChangeKind::Removed(_)))
-        .count();
+    let (mut added_count, mut modified_count, mut removed_count) = (0, 0, 0);
+    for change in &changes {
+        match &change.kind {
+            ChangeKind::Added(_) => added_count += 1,
+            ChangeKind::Modified(_) => modified_count += 1,
+            ChangeKind::Removed(_) => removed_count += 1,
+        }
+    }
 
     // Write diff file(s)
     if let Some(max_bytes) = split_size {
@@ -135,7 +128,7 @@ fn write_snapshot(
 /// Write split diff files
 fn write_split_diff(
     diff_out: &Path,
-    changes: &Vec<Change>,
+    changes: &[Change],
     source_snapshot_hash: [u8; 32],
     root_dir: &Path,
     max_bytes: u64,
