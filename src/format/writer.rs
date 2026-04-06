@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{GappedError, Result};
 use crate::format::header::{EOR, FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
 use crate::model::diff::Change;
 use crate::model::entry::Entry;
@@ -117,11 +117,10 @@ impl<W: Write> FormatWriter<W> {
             let to_read = (remaining as usize).min(buf.len());
             let n = reader.read(&mut buf[..to_read])?;
             if n == 0 {
-                let pad = vec![0u8; remaining as usize];
-                self.inner.write_all(&pad)?;
-                self.hasher.update(&pad);
-                self.bytes_written += remaining;
-                break;
+                return Err(GappedError::InvalidFormat(format!(
+                    "Unexpected EOF: expected {} more bytes of file content",
+                    remaining
+                )));
             }
             self.inner.write_all(&buf[..n])?;
             self.hasher.update(&buf[..n]);
