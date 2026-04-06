@@ -76,7 +76,7 @@ impl FormatReader {
         }
 
         // Read record length
-        let mut len_bytes = [0u8; 4];
+        let mut len_bytes = [0u8; 8];
         self.inner.read_exact(&mut len_bytes)?;
 
         // Read type byte
@@ -84,7 +84,7 @@ impl FormatReader {
         self.inner.read_exact(&mut type_byte)?;
 
         // Check for EOR
-        if len_bytes == [0u8; 4] && type_byte[0] == 0 {
+        if len_bytes == [0u8; 8] && type_byte[0] == 0 {
             self.hasher.update(&len_bytes);
             self.hasher.update(&type_byte);
 
@@ -106,7 +106,7 @@ impl FormatReader {
             GappedError::InvalidFormat(format!("Unknown record type: {:?}", type_byte[0]))
         })?;
 
-        let payload_len = u32::from_le_bytes(len_bytes) as usize;
+        let payload_len = u64::from_le_bytes(len_bytes) as usize;
 
         // Update hashser with length + type
         self.hasher.update(&len_bytes);

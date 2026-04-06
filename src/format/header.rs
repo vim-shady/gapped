@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 /// Magic bytes identifying a gapped file
-pub const MAGIC: &[u8; 9] = b"GAPPED\x00\x01\x00";
+pub const MAGIC: &[u8; 9] = b"GAPPED\x00\x02\x00";
 
 /// Magic bytes for identifying a zstd-compressed gapped file
-pub const MAGIC_COMPRESSED: &[u8; 9] = b"GAPPEDZ01";
+pub const MAGIC_COMPRESSED: &[u8; 9] = b"GAPPEDZ02";
 
 /// End of record marker
-pub const EOR: [u8; 5] = [0u8; 5];
+pub const EOR: [u8; 9] = [0u8; 9];
 
 /// Record types in binary format
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

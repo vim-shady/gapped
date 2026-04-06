@@ -102,15 +102,14 @@ impl<W: Write> FormatWriter<W> {
         reader: &mut R,
         size: u64,
     ) -> Result<()> {
-        let total_len = size as u32;
-        let len_bytes = total_len.to_le_bytes();
+        let len_bytes = size.to_le_bytes();
         let type_byte = [RecordType::FileContent as u8];
 
         self.inner.write_all(&len_bytes)?;
         self.hasher.update(&len_bytes);
         self.inner.write_all(&type_byte)?;
         self.hasher.update(&type_byte);
-        self.bytes_written += 5;
+        self.bytes_written += 9;
 
         let mut buf = [0u8; 64 * 1024];
         let mut remaining = size;
@@ -154,14 +153,14 @@ impl<W: Write> FormatWriter<W> {
 
     /// Write a single record
     fn write_record(&mut self, record_type: RecordType, payload: &[u8]) -> Result<()> {
-        let len_bytes = (payload.len() as u32).to_le_bytes();
+        let len_bytes = (payload.len() as u64).to_le_bytes();
         let type_byte = [record_type as u8];
 
         self.inner.write_all(&len_bytes)?;
         self.hasher.update(&len_bytes);
         self.inner.write_all(&type_byte)?;
         self.hasher.update(&type_byte);
-        self.bytes_written += 5;
+        self.bytes_written += 9;
 
         self.inner.write_all(payload)?;
         self.hasher.update(payload);
