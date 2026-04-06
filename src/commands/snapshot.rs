@@ -1,3 +1,4 @@
+use crate::error::{GappedError, Result};
 use crate::format::header::FileHeader;
 use crate::format::reader::{FormatReader, Record};
 use crate::format::writer::FormatWriter;
@@ -5,7 +6,6 @@ use crate::fs::walk::walk_filesystem;
 use crate::model::entry::Entry;
 use crate::model::path::RelativePath;
 use crate::model::snapshot::Snapshot;
-use anyhow::Result;
 use log::info;
 use std::collections::HashMap;
 use std::fs::File;
@@ -55,7 +55,7 @@ pub fn run_snapshot(
 ) -> Result<()> {
     // Validate root_dir
     if !root_dir.is_dir() {
-        return Err(anyhow::anyhow!("Root directory does not exist"));
+        return Err(GappedError::RootNotFound(root_dir.to_path_buf()));
     }
 
     let root_dir = root_dir.canonicalize()?;
@@ -88,7 +88,7 @@ pub fn run_snapshot(
         source_snapshot_hash: None,
         root_dir: Some(root_dir.to_string_lossy().to_string()),
         chunk_index: None,
-        more_chunks: None
+        more_chunks: None,
     };
 
     let mut writer = if compress {
@@ -116,6 +116,8 @@ pub fn run_snapshot(
 }
 
 pub fn hash_snapshot_file(snapshot_path: &Path) -> Result<[u8; 32]> {
-    crate::fs::hash::hash_file(snapshot_path)
-        .map_err(|e| anyhow::anyhow!("Failed to hash snapshot file: {}", e))
+    crate::fs::hash::hash_file(snapshot_path).map_err(|e| GappedError::IoPath {
+        path: snapshot_path.to_path_buf(),
+        source: e,
+    })
 }

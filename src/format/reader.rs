@@ -1,7 +1,7 @@
+use crate::error::{GappedError, Result};
 use crate::format::header::{FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
 use crate::model::diff::Change;
 use crate::model::entry::Entry;
-use anyhow::Result;
 use std::io::{BufReader, Read};
 
 /// Record read from binary format
@@ -32,7 +32,10 @@ impl FormatReader {
         } else if &magic == MAGIC_COMPRESSED {
             true
         } else {
-            return Err(anyhow::anyhow!("Invalid magic bytes: {:?}", magic));
+            return Err(GappedError::InvalidFormat(format!(
+                "Invalid magic bytes: {:?}",
+                magic
+            )));
         };
 
         let mut reader: Box<dyn Read> = if compressed {
@@ -91,13 +94,17 @@ impl FormatReader {
 
             let expected_hash = self.hasher.finalize();
             if expected_hash.as_bytes() != &checksum_bytes {
-                return Err(anyhow::anyhow!("Checksum mismatch"));
+                return Err(GappedError::ChecksumMismatch {
+                    expected: Self::hex_encode(expected_hash.as_bytes()),
+                    got: Self::hex_encode(&checksum_bytes),
+                });
             }
             self.finished = true;
             return Ok(None);
         }
-        let record_type = RecordType::from_u8(type_byte[0])
-            .ok_or_else(|| anyhow::anyhow!("Invalid record type: {:?}", type_byte[0]))?;
+        let record_type = RecordType::from_u8(type_byte[0]).ok_or_else(|| {
+            GappedError::InvalidFormat(format!("Unknown record type: {:?}", type_byte[0]))
+        })?;
 
         let payload_len = u32::from_le_bytes(len_bytes) as usize;
 
@@ -131,5 +138,9 @@ impl FormatReader {
             records.push(record);
         }
         Ok(records)
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }

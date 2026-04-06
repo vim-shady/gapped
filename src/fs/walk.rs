@@ -1,13 +1,13 @@
-use rayon::iter::ParallelIterator;
+use crate::error::Result;
 use crate::fs::hash::hash_file;
 use crate::fs::metadata::collect_metadata;
 use crate::model::entry::{Entry, EntryKind};
 use crate::model::path::RelativePath;
-use anyhow::Result;
 use log::{info, warn};
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator;
 use std::collections::HashMap;
 use std::path::Path;
-use rayon::iter::IntoParallelRefIterator;
 use walkdir::WalkDir;
 
 /// Statistics from single filesystem walk.

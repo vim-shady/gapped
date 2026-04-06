@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use crate::error::{GappedError, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -9,7 +9,9 @@ pub struct RelativePath(PathBuf);
 impl RelativePath {
     /// Create a RelativePath from full path by stripping root prefix
     pub fn from_full_path(full_path: &Path, root: &Path) -> Result<Self> {
-        let relative_path = full_path.strip_prefix(root)?;
+        let relative_path = full_path
+            .strip_prefix(root)
+            .map_err(|_| GappedError::InvalidPath(full_path.to_path_buf()))?;
         Self::new(relative_path)
     }
 
@@ -21,7 +23,7 @@ impl RelativePath {
                 Component::Normal(c) => normalized.push(c),
                 Component::CurDir => {} // skip ".",
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    bail!("Invalid path: {}", path.display())
+                    return Err(GappedError::InvalidPath(path.to_path_buf()));
                 }
             }
         }

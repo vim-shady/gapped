@@ -1,10 +1,11 @@
 use crate::commands::snapshot::hash_snapshot_file;
+use crate::error::GappedError;
+use crate::error::Result;
 use crate::format::header::FileHeader;
 use crate::format::writer::FormatWriter;
 use crate::model::diff::{AddedEntry, Change, ChangeKind, Diff, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
 use crate::model::snapshot::Snapshot;
-use anyhow::Result;
 use log::info;
 use std::cmp::Ordering;
 use std::fs::File;
@@ -21,10 +22,7 @@ pub fn run_diff(
 ) -> Result<()> {
     // Validate root dir
     if !root_dir.is_dir() {
-        return Err(anyhow::anyhow!(
-            "Root directory does not exist: {}",
-            root_dir.display()
-        ));
+        return Err(GappedError::RootNotFound(root_dir.to_path_buf()));
     }
 
     let root_dir = root_dir.canonicalize()?;

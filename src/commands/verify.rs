@@ -1,10 +1,10 @@
 use crate::commands::snapshot::load_snapshot_entries;
+use crate::error::{GappedError, Result};
 use crate::format::reader::{FormatReader, Record};
 use crate::fs::walk::walk_filesystem;
 use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::Entry;
 use crate::model::path::RelativePath;
-use anyhow::Result;
 use log::info;
 use std::collections::HashMap;
 use std::fs::File;
@@ -16,10 +16,7 @@ use std::path::Path;
 /// against the target snapshot.
 pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -> Result<()> {
     if !root_dir.is_dir() {
-        return Err(anyhow::anyhow!(
-            "Root directory {} does not exist",
-            root_dir.display()
-        ));
+        return Err(GappedError::RootNotFound(root_dir.to_path_buf()));
     }
 
     let root_dir = root_dir.canonicalize()?;
@@ -129,7 +126,7 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
         Ok(())
     } else {
         eprintln!("Verify failed: {} discrepancies found", discrepancies);
-        Err(anyhow::anyhow!("Verify failed"))
+        Err(GappedError::VerificationFailed(discrepancies))
     }
 }
 
@@ -151,14 +148,8 @@ mod tests {
         fn set_mtime_from(path: &Path, src_meta: &fs::Metadata) {
             let atime = TimeSpec::UTIME_OMIT;
             let mtime = TimeSpec::new(src_meta.mtime(), src_meta.mtime_nsec() as i64);
-            nix::sys::stat::utimensat(
-                None,
-                path,
-                &atime,
-                &mtime,
-                UtimensatFlags::NoFollowSymlink,
-            )
-            .unwrap();
+            nix::sys::stat::utimensat(None, path, &atime, &mtime, UtimensatFlags::NoFollowSymlink)
+                .unwrap();
         }
 
         fs::create_dir_all(dst).unwrap();

@@ -1,7 +1,7 @@
+use crate::error::Result;
 use crate::format::header::{EOR, FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
 use crate::model::diff::Change;
 use crate::model::entry::Entry;
-use anyhow::Result;
 use std::io;
 use std::io::Write;
 

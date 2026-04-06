@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod error;
 mod format;
 mod fs;
 mod model;
@@ -13,6 +14,8 @@ use crate::commands::verify::run_verify;
 use cli::{Cli, Commands};
 
 fn main() {
+    env_logger::init();
+
     let cli = Cli::parse();
 
     let result = match cli.command {

@@ -1,22 +1,19 @@
+use crate::error::{GappedError, Result};
 use crate::format::reader::{FormatReader, Record};
 use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::{EntryKind, Metadata};
-use anyhow::Result;
 use log::{info, warn};
 use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::{symlink_metadata, File, Permissions};
+use std::fs::{File, Permissions, symlink_metadata};
 use std::io::BufReader;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     if !root_dir.is_dir() {
-        return Err(anyhow::anyhow!(
-            "Root directory {} does not exist",
-            root_dir.display()
-        ));
+        return Err(GappedError::RootNotFound(root_dir.to_path_buf()));
     }
 
     let root_dir = root_dir.canonicalize()?;
