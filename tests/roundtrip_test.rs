@@ -33,7 +33,7 @@ fn test_roundtrip() {
     assert!(fixture.verify_rsync_identical());
 
     // Make changes
-    thread::sleep(std::time::Duration::from_secs(1));
+    thread::sleep(std::time::Duration::from_millis(1100));
     create_file(&fixture.source().join("file1.txt"), "modified content\n");
     create_file(&fixture.source().join("file3.txt"), "new file content\n");
     remove_file(fixture.source().join("file2.txt")).unwrap();
@@ -83,7 +83,7 @@ fn test_kind_change() {
     fixture.sync_source_to_target();
 
     // Change kind
-    thread::sleep(std::time::Duration::from_secs(1));
+    thread::sleep(std::time::Duration::from_millis(1100));
     remove_file(fixture.source().join("subject1")).unwrap();
     symlink("subject2", fixture.source().join("subject1")).unwrap();
     remove_file(fixture.source().join("subject2")).unwrap();
@@ -123,7 +123,7 @@ fn test_nesting() {
     fixture.sync_source_to_target();
 
     // Add deeper, modify existing
-    thread::sleep(std::time::Duration::from_secs(1));
+    thread::sleep(std::time::Duration::from_millis(1100));
     create_file(
         &fixture.source().join("a/b/c/d/e/deeper.txt"),
         "even deeper\n",
@@ -165,7 +165,7 @@ fn test_directory_removal() {
     fixture.sync_source_to_target();
 
     // delete entire directory tree
-    thread::sleep(std::time::Duration::from_secs(1));
+    thread::sleep(std::time::Duration::from_millis(1100));
     remove_dir_all(fixture.source().join("dir")).unwrap();
 
     let diff1 = fixture.working_file("diff1");
@@ -201,7 +201,7 @@ fn test_verify() {
     ]));
     fixture.sync_source_to_target();
 
-    thread::sleep(std::time::Duration::from_secs(1));
+    thread::sleep(std::time::Duration::from_millis(1100));
     create_file(&fixture.source().join("file1.txt"), "modfified\n");
     create_file(&fixture.source().join("file2.txt"), "new file\n");
 
@@ -231,7 +231,7 @@ fn test_verify() {
     ]));
 
     // make some more changes
-    thread::sleep(std::time::Duration::from_secs(1));
+    thread::sleep(std::time::Duration::from_millis(1100));
     create_file(&fixture.source().join("file1.txt"), "modified again\n");
     remove_file(fixture.source().join("file2.txt")).unwrap();
 
@@ -270,7 +270,7 @@ fn test_iterative_sync() {
     fixture.sync_source_to_target();
 
     // round 1
-    thread::sleep(std::time::Duration::from_secs(1));
+    thread::sleep(std::time::Duration::from_millis(1100));
     create_file(&fixture.source().join("file1.txt"), "v2\n");
     create_file(&fixture.source().join("file2.txt"), "new\n");
 
@@ -291,7 +291,7 @@ fn test_iterative_sync() {
     assert!(fixture.verify_rsync_identical());
 
     // round 2
-    thread::sleep(std::time::Duration::from_secs(1));
+    thread::sleep(std::time::Duration::from_millis(1100));
     remove_file(fixture.source().join("file2.txt")).unwrap();
     create_file(&fixture.source().join("file3.txt"), "new\n");
 
@@ -341,7 +341,7 @@ fn test_split_diff_roundtrip() {
     ]));
 
     // mutate source
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_millis(1100));
     for i in 0..12 {
         create_file(
             &fixture.source().join(format!("file_{:02}.txt", i)),
@@ -410,7 +410,7 @@ fn test_permission_change() {
     fixture.sync_source_to_target();
 
     // change permissisons only
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_millis(1100));
     fs::set_permissions(
         fixture.source().join("script.sh"),
         std::os::unix::fs::PermissionsExt::from_mode(0o755),

@@ -826,7 +826,7 @@ mod tests {
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(source.join("f_000.dat"), b"updated").unwrap();
 
         let diff = tmp.path().join("diff.gapped");
@@ -850,7 +850,7 @@ mod tests {
         run_snapshot(&source, &snap1, None, false).unwrap();
 
         // modify every file so the diff contains changes for every file
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..10 {
             fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'b'; 2048]).unwrap();
         }
@@ -885,7 +885,7 @@ mod tests {
         run_snapshot(&source, &snap1, None, false).unwrap();
 
         // 15 modifications + 1 addition + 1 removal = 17 changes
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..15 {
             fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'b'; 1024]).unwrap();
         }
@@ -915,7 +915,7 @@ mod tests {
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..6 {
             fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'z'; 2048]).unwrap();
         }
@@ -945,7 +945,7 @@ mod tests {
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..8 {
             fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'c'; 2048]).unwrap();
         }

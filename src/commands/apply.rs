@@ -447,7 +447,7 @@ mod tests {
         run_snapshot(&source, &snap1, None, false).unwrap();
 
         // modify every file
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..12 {
             fs::write(source.join(format!("file_{:02}.txt", i)), vec![b'b'; 2048]).unwrap();
         }
