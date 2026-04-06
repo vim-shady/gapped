@@ -171,23 +171,7 @@ fn write_split_diff(
 
         // write changes until size limit
         while change_index < changes.len() {
-            let change = &changes[change_index];
-            writer.write_diff_change(change)?;
-
-            // write file content if needed
-            match &change.kind {
-                ChangeKind::Added(added) if added.has_content => {
-                    let full_path = change.path.to_full_path(root_dir);
-                    let content = std::fs::read(&full_path).unwrap_or_default();
-                    writer.write_file_content(&content)?;
-                }
-                ChangeKind::Modified(modified) if modified.has_content => {
-                    let full_path = change.path.to_full_path(root_dir);
-                    let content = std::fs::read(&full_path).unwrap_or_default();
-                    writer.write_file_content(&content)?;
-                }
-                _ => {}
-            }
+            write_one_change(&mut writer, &changes[change_index], root_dir)?;
             change_index += 1;
 
             // check if size limit exceeded
@@ -239,7 +223,6 @@ fn write_single_diff(
     Ok(())
 }
 
-// TODO: refactor this mess
 /// Write changes to a format writer, incl. file content
 fn write_changes<W: std::io::Write>(
     writer: &mut FormatWriter<W>,
@@ -247,41 +230,36 @@ fn write_changes<W: std::io::Write>(
     root_dir: &Path,
 ) -> Result<()> {
     for change in changes {
-        writer.write_diff_change(change)?;
+        write_one_change(writer, change, root_dir)?;
+    }
+    Ok(())
+}
 
-        match &change.kind {
-            ChangeKind::Added(added) if added.has_content => {
-                let full_path = change.path.to_full_path(root_dir);
-                match File::open(&full_path) {
-                    Ok(file) => {
-                        let meta_data = file.metadata()?;
-                        let size = meta_data.len();
-                        let mut reader = BufReader::new(file);
-                        writer.write_file_content_from_reader(&mut reader, size)?;
-                    }
-                    Err(e) => {
-                        log::warn!("Cannot read file {}: {}", full_path.display(), e);
-                        // Write empty file content
-                        writer.write_file_content(&[])?;
-                    }
-                }
+/// Write a single change record and its file content (if any) to the writer.
+fn write_one_change<W: std::io::Write>(
+    writer: &mut FormatWriter<W>,
+    change: &Change,
+    root_dir: &Path,
+) -> Result<()> {
+    writer.write_diff_change(change)?;
+
+    let needs_content = matches!(&change.kind, ChangeKind::Added(a) if a.has_content)
+        || matches!(&change.kind, ChangeKind::Modified(m) if m.has_content);
+
+    if needs_content {
+        let full_path = change.path.to_full_path(root_dir);
+        match File::open(&full_path) {
+            Ok(file) => {
+                let size = file.metadata()?.len();
+                let mut reader = BufReader::new(file);
+                writer.write_file_content_from_reader(&mut reader, size)?;
             }
-            ChangeKind::Modified(modified) if modified.has_content => {
-                let full_path = change.path.to_full_path(root_dir);
-                match File::open(&full_path) {
-                    Ok(file) => {
-                        let meta_data = file.metadata()?;
-                        let size = meta_data.len();
-                        let mut reader = BufReader::new(file);
-                        writer.write_file_content_from_reader(&mut reader, size)?;
-                    }
-                    Err(e) => {
-                        log::warn!("Cannot read file {}: {}", full_path.display(), e);
-                        writer.write_file_content(&[])?;
-                    }
-                }
+            Err(e) => {
+                return Err(GappedError::IoPath {
+                    path: full_path,
+                    source: e,
+                });
             }
-            _ => {}
         }
     }
 
