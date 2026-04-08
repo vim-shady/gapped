@@ -45,6 +45,11 @@ impl<W: Write> FormatWriter<W> {
         Self::new_impl(inner, header, true)
     }
 
+    /// Create a FormatWriter, optionally compressed
+    pub fn maybe_compressed(inner: W, header: &FileHeader, compress: bool) -> Result<Self> {
+        Self::new_impl(inner, header, compress)
+    }
+
     fn new_impl(mut inner: W, header: &FileHeader, compress: bool) -> Result<Self> {
         let mut hasher = blake3::Hasher::new();
 

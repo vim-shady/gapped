@@ -1,4 +1,7 @@
+use crate::model::diff::Diff;
+use crate::model::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Magic bytes identifying a gapped file
 pub const MAGIC: &[u8; 9] = b"GAPPED\x00\x02\x00";
@@ -46,4 +49,35 @@ pub struct FileHeader {
     pub root_dir: Option<String>,
     /// For split diffs: chunk number (1-based, matches filename suffix)
     pub chunk_index: Option<u32>,
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+impl FileHeader {
+    pub fn snapshot(root_dir: &Path) -> Self {
+        Self {
+            file_type: "snapshot".to_string(),
+            version: Snapshot::CURRENT_VERSION,
+            created_at: now_unix_secs(),
+            source_snapshot_hash: None,
+            root_dir: Some(root_dir.to_string_lossy().into_owned()),
+            chunk_index: None,
+        }
+    }
+
+    pub fn diff(source_snapshot_hash: [u8; 32], chunk_index: Option<u32>) -> Self {
+        Self {
+            file_type: "diff".to_string(),
+            version: Diff::CURRENT_VERSION,
+            created_at: now_unix_secs(),
+            source_snapshot_hash: Some(source_snapshot_hash),
+            root_dir: None,
+            chunk_index,
+        }
+    }
 }

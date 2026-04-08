@@ -1,9 +1,8 @@
 use crate::error::{GappedError, Result};
 use crate::format::header::FileHeader;
 use crate::format::writer::FormatWriter;
-use crate::model::diff::{AddedEntry, Change, ChangeKind, Diff, ModifiedEntry};
+use crate::model::diff::{AddedEntry, Change, ChangeKind, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
-use crate::model::snapshot::Snapshot;
 use log::info;
 use std::cmp::Ordering;
 use std::fs::File;
@@ -28,12 +27,13 @@ pub fn run_diff(
             source: e,
         })?;
 
-    // Load the input snapshot
+    // Load the input snapshot once, derive both Vec and HashMap
     info!("Loading input snapshot {}", snapshot_in.display());
     let (old_entries, _old_header) = crate::commands::snapshot::load_snapshot(snapshot_in)?;
-
-    // Load old snapshot as HashMap for hash reuse
-    let (old_entries_map, _) = crate::commands::snapshot::load_snapshot_entries(snapshot_in)?;
+    let old_entries_map: std::collections::HashMap<_, _> = old_entries
+        .iter()
+        .map(|e| (e.path.clone(), e.clone()))
+        .collect();
 
     // Walk current filesystem
     info!("Walking filesystem under {}", root_dir.display());
@@ -99,23 +99,9 @@ fn write_snapshot(
     let file = File::create(snapshot_out)?;
     let buf_writer = BufWriter::new(file);
 
-    let header = FileHeader {
-        file_type: "snapshot".to_string(),
-        version: Snapshot::CURRENT_VERSION,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        source_snapshot_hash: None,
-        root_dir: Some(root_dir.to_string_lossy().into_owned()),
-        chunk_index: None,
-    };
+    let header = FileHeader::snapshot(root_dir);
 
-    let mut writer: FormatWriter<BufWriter<File>> = if compress {
-        FormatWriter::new_compressed(buf_writer, &header)?
-    } else {
-        FormatWriter::new(buf_writer, &header)?
-    };
+    let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
 
     for entry in entries {
         writer.write_snapshot_entry(entry)?;
@@ -143,22 +129,8 @@ fn write_split_diff(
         let file = File::create(&chunk_path)?;
         let buf_writer = BufWriter::new(file);
 
-        let header = FileHeader {
-            file_type: "diff".to_string(),
-            version: Diff::CURRENT_VERSION,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            source_snapshot_hash: Some(source_snapshot_hash),
-            root_dir: None,
-            chunk_index: Some(chunk_number),
-        };
-        let mut writer: FormatWriter<BufWriter<File>> = if compress {
-            FormatWriter::new_compressed(buf_writer, &header)?
-        } else {
-            FormatWriter::new(buf_writer, &header)?
-        };
+        let header = FileHeader::diff(source_snapshot_hash, Some(chunk_number));
+        let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
 
         // write changes until size limit
         while change_index < changes.len() {
@@ -189,23 +161,9 @@ fn write_single_diff(
     let file = File::create(diff_out)?;
     let buf_writer = BufWriter::new(file);
 
-    let header = FileHeader {
-        file_type: "diff".to_string(),
-        version: Diff::CURRENT_VERSION,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        source_snapshot_hash: Some(source_snapshot_hash),
-        root_dir: None,
-        chunk_index: None,
-    };
+    let header = FileHeader::diff(source_snapshot_hash, None);
 
-    let mut writer = if compress {
-        FormatWriter::new_compressed(buf_writer, &header)?
-    } else {
-        FormatWriter::new(buf_writer, &header)?
-    };
+    let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
 
     write_changes(&mut writer, changes, root_dir)?;
 

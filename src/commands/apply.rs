@@ -358,20 +358,7 @@ mod tests {
     use std::fs::{self, File};
     use tempfile::TempDir;
 
-    fn copy_dir_tree(src: &Path, dst: &Path) {
-        fs::create_dir_all(dst).unwrap();
-        for entry in fs::read_dir(src).unwrap() {
-            let entry = entry.unwrap();
-            let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
-            let file_type = entry.file_type().unwrap();
-            if file_type.is_dir() {
-                copy_dir_tree(&src_path, &dst_path);
-            } else if file_type.is_file() {
-                fs::copy(&src_path, &dst_path).unwrap();
-            }
-        }
-    }
+    use crate::test_util::copy_tree;
 
     #[test]
     fn test_detect_diff_files_single_file() {
@@ -432,7 +419,7 @@ mod tests {
             fs::write(source.join(format!("file_{:02}.txt", i)), vec![b'a'; 1024]).unwrap();
         }
 
-        copy_dir_tree(&source, &target);
+        copy_tree(&source, &target);
 
         // initila snapshot
         let snap1 = tmp.path().join("snap1");
@@ -482,7 +469,7 @@ mod tests {
             fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'x'; 2048]).unwrap();
         }
 
-        copy_dir_tree(&source, &target);
+        copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false).unwrap();

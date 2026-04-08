@@ -4,6 +4,8 @@ mod error;
 mod format;
 mod fs;
 mod model;
+#[cfg(test)]
+mod test_util;
 
 use clap::Parser;
 

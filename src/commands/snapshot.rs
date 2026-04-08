@@ -5,30 +5,11 @@ use crate::format::writer::FormatWriter;
 use crate::fs::walk::walk_filesystem;
 use crate::model::entry::Entry;
 use crate::model::path::RelativePath;
-use crate::model::snapshot::Snapshot;
 use log::info;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
-
-/// Load a snapshot from a file, returning the entries as a HashMap for O(1) lookup
-pub fn load_snapshot_entries(
-    snapshot_path: &Path,
-) -> Result<(HashMap<RelativePath, Entry>, FileHeader)> {
-    let file = File::open(snapshot_path)?;
-    let reader = std::io::BufReader::new(file);
-    let (mut format_reader, header) = FormatReader::new(reader)?;
-
-    let mut entries: HashMap<RelativePath, Entry> = HashMap::new();
-    let records = format_reader.read_all_records()?;
-    for record in records {
-        if let Record::SnapshotEntry(entry) = record {
-            entries.insert(entry.path.clone(), entry);
-        }
-    }
-    Ok((entries, header))
-}
 
 /// Load a snapshot from a file (should already be sorted by path)
 pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
@@ -36,15 +17,28 @@ pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
     let reader = std::io::BufReader::new(file);
     let (mut format_reader, header) = FormatReader::new(reader)?;
 
-    let mut entries = Vec::new();
-    let records = format_reader.read_all_records()?;
-    for record in records {
-        if let Record::SnapshotEntry(entry) = record {
-            entries.push(entry);
-        }
-    }
+    let entries = format_reader
+        .read_all_records()?
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::SnapshotEntry(entry) => Some(entry),
+            _ => None,
+        })
+        .collect();
 
     Ok((entries, header))
+}
+
+/// Load a snapshot from a file, returning the entries as a HashMap for O(1) lookup
+pub fn load_snapshot_entries(
+    snapshot_path: &Path,
+) -> Result<(HashMap<RelativePath, Entry>, FileHeader)> {
+    let (entries, header) = load_snapshot(snapshot_path)?;
+    let map = entries
+        .into_iter()
+        .map(|e| (e.path.clone(), e))
+        .collect();
+    Ok((map, header))
 }
 
 pub fn run_snapshot(
@@ -73,23 +67,9 @@ pub fn run_snapshot(
     let file = File::create(snapshot_out)?;
     let buf_writer = BufWriter::new(file);
 
-    let header = FileHeader {
-        file_type: "snapshot".to_string(),
-        version: Snapshot::CURRENT_VERSION,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        source_snapshot_hash: None,
-        root_dir: Some(root_dir.to_string_lossy().to_string()),
-        chunk_index: None,
-    };
+    let header = FileHeader::snapshot(&root_dir);
 
-    let mut writer = if compress {
-        FormatWriter::new_compressed(buf_writer, &header)?
-    } else {
-        FormatWriter::new(buf_writer, &header)?
-    };
+    let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
 
     for entry in &entries {
         writer.write_snapshot_entry(entry)?;
