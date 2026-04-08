@@ -23,13 +23,31 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
     info!("Walk filesystem at {}", root_dir.display());
     let (current_entries_vec, _) = walk_filesystem(&root_dir, None)?;
 
-    // Build a map of current entries
     let mut simulated: HashMap<RelativePath, Entry> = current_entries_vec
         .into_iter()
         .map(|entry| (entry.path.clone(), entry))
         .collect();
 
-    // Load and parse all diff changes
+    let changes = parse_diff_changes(diff_files)?;
+    info!("Simulating applying diff ({} changes)", changes.len());
+    simulate_changes(&mut simulated, &changes);
+
+    let discrepancies = compare_entries(&simulated, &target_entries);
+    for msg in &discrepancies {
+        eprintln!("{}", msg);
+    }
+
+    if discrepancies.is_empty() {
+        eprintln!("Verify complete: simulated state matches target snapshot");
+        Ok(())
+    } else {
+        eprintln!("Verify failed: {} discrepancies found", discrepancies.len());
+        Err(GappedError::VerificationFailed(discrepancies.len()))
+    }
+}
+
+/// Load and parse all diff change records from the given files (ignoring file content).
+fn parse_diff_changes(diff_files: &[&Path]) -> Result<Vec<Change>> {
     let mut all_changes: Vec<Change> = Vec::new();
 
     for diff_path in diff_files {
@@ -39,7 +57,6 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
         let (mut format_reader, _header) = FormatReader::new(reader)?;
 
         let records = format_reader.read_all_records()?;
-
         for record in records {
             if let Record::DiffChange(change) = record {
                 all_changes.push(change);
@@ -47,9 +64,15 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
         }
     }
 
-    // Simulate applying the diff
-    info!("Simulating applying diff ({} changes)", all_changes.len());
-    for change in &all_changes {
+    Ok(all_changes)
+}
+
+/// Apply changes to the simulated entry map (in-memory simulation of apply).
+fn simulate_changes(
+    simulated: &mut HashMap<RelativePath, Entry>,
+    changes: &[Change],
+) {
+    for change in changes {
         match &change.kind {
             ChangeKind::Removed(_) => {
                 simulated.remove(&change.path);
@@ -72,58 +95,55 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
             }
         }
     }
+}
 
-    // Compare simulated entries with target entries
-    let mut discrepancies = 0;
+/// Compare simulated entries against target entries. Returns discrepancy messages.
+fn compare_entries(
+    simulated: &HashMap<RelativePath, Entry>,
+    target: &HashMap<RelativePath, Entry>,
+) -> Vec<String> {
+    let mut discrepancies = Vec::new();
 
-    // Check each entry in target snapshot
-    for (path, target_entry) in &target_entries {
+    for (path, target_entry) in target {
         match simulated.get(path) {
             None => {
-                eprintln!("MISSING: {} (in snapshot but not in simulated state)", path);
-                discrepancies += 1;
+                discrepancies.push(format!(
+                    "MISSING: {} (in snapshot but not in simulated state)",
+                    path
+                ));
             }
             Some(simulated_entry) => {
                 if simulated_entry.kind != target_entry.kind {
-                    eprintln!(
+                    discrepancies.push(format!(
                         "KIND MISMATCH: {} (expected {:?}, got {:?})",
                         path, target_entry.kind, simulated_entry.kind
-                    );
-                    discrepancies += 1;
+                    ));
                 }
                 if !simulated_entry.metadata.matches(&target_entry.metadata) {
-                    eprintln!("METADATA MISMATCH: {}", path);
-                    eprintln!("  simulated: {:?}", simulated_entry.metadata);
-                    eprintln!("  target:    {:?}", target_entry.metadata);
-                    discrepancies += 1;
+                    discrepancies.push(format!("METADATA MISMATCH: {}", path));
+                    discrepancies.push(format!("  simulated: {:?}", simulated_entry.metadata));
+                    discrepancies.push(format!("  target:    {:?}", target_entry.metadata));
                 }
                 if simulated_entry.hash != target_entry.hash {
-                    eprintln!("HASH MISMATCH: {}", path);
-                    discrepancies += 1;
+                    discrepancies.push(format!("HASH MISMATCH: {}", path));
                 }
                 if simulated_entry.symlink_target != target_entry.symlink_target {
-                    eprintln!("SYMLINK MISMATCH: {}", path);
-                    discrepancies += 1;
+                    discrepancies.push(format!("SYMLINK MISMATCH: {}", path));
                 }
             }
         }
     }
 
-    // CHeck for extra entries not in the snapshot
-    for (path, _) in &simulated {
-        if !target_entries.contains_key(path) {
-            eprintln!("EXTRA: {} (in simulated state but not in snapshot)", path);
-            discrepancies += 1;
+    for path in simulated.keys() {
+        if !target.contains_key(path) {
+            discrepancies.push(format!(
+                "EXTRA: {} (in simulated state but not in snapshot)",
+                path
+            ));
         }
     }
 
-    if discrepancies == 0 {
-        eprintln!("Verify complete: simulated state matches target snapshot");
-        Ok(())
-    } else {
-        eprintln!("Verify failed: {} discrepancies found", discrepancies);
-        Err(GappedError::VerificationFailed(discrepancies))
-    }
+    discrepancies
 }
 
 #[cfg(test)]

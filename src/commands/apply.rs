@@ -2,18 +2,46 @@ use crate::error::{GappedError, Result};
 use crate::format::reader::{FormatReader, Record};
 use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::{EntryKind, Metadata};
+use crate::model::path::RelativePath;
 use log::{info, warn};
 use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::{File, Permissions, symlink_metadata};
+use std::fs::{File, Permissions};
 use std::io::BufReader;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
+struct ApplyResult {
+    add_count: usize,
+    mod_count: usize,
+    err_count: usize,
+    dir_metadata_changes: Vec<(RelativePath, Metadata)>,
+}
+
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
+    let all_changes = parse_diff_files(diff_files)?;
+    info!("Applying {} changes", all_changes.len());
 
+    let saved_dir_mtimes = save_parent_dir_mtimes(&all_changes, &root_dir);
+    let (del_count, mut err_count) = apply_deletions(&all_changes, &root_dir);
+    let result = apply_additions_and_modifications(&all_changes, &root_dir);
+    err_count += result.err_count;
+    restore_directory_mtimes(&result.dir_metadata_changes, saved_dir_mtimes, &root_dir);
+
+    eprintln!("Apply complete:");
+    eprintln!("  Added: {}", result.add_count);
+    eprintln!("  Modified: {}", result.mod_count);
+    eprintln!("  Deleted: {}", del_count);
+    if err_count > 0 {
+        eprintln!("  Errors: {}", err_count);
+    }
+    Ok(())
+}
+
+/// Read all diff files and pair each change record with its file content (if any).
+fn parse_diff_files(diff_files: &[&Path]) -> Result<Vec<(Change, Option<Vec<u8>>)>> {
     let mut all_changes: Vec<(Change, Option<Vec<u8>>)> = Vec::new();
 
     for diff_path in diff_files {
@@ -53,23 +81,26 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
                 }
             }
         }
-        // Flush any trailing change that expected content but didn't get it
         if let Some(change) = pending_change.take() {
             all_changes.push((change, None));
         }
     }
 
-    info!("Applying {} changes", all_changes.len());
+    Ok(all_changes)
+}
 
-    // Collect all directory paths that have explicit metadata changes in the diff
-    // Collet all parent directories that will be affected by file operations
+/// Save mtimes of parent directories that will be implicitly touched by file operations
+/// but don't have explicit metadata changes in the diff.
+fn save_parent_dir_mtimes(
+    all_changes: &[(Change, Option<Vec<u8>>)],
+    root_dir: &Path,
+) -> HashMap<PathBuf, (i64, u32)> {
     let mut dirs_with_explicit_changes: HashSet<PathBuf> = HashSet::new();
     let mut affected_parent_dirs: HashSet<PathBuf> = HashSet::new();
 
-    for (change, _) in &all_changes {
-        let full_path = change.path.to_full_path(&root_dir);
+    for (change, _) in all_changes {
+        let full_path = change.path.to_full_path(root_dir);
 
-        // Track parent directories that will be affected by file operations
         if let Some(parent_dir) = full_path.parent() {
             affected_parent_dirs.insert(parent_dir.to_path_buf());
         }
@@ -81,7 +112,7 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
             ChangeKind::Modified(modified) => {
                 if modified.new_metadata.is_some() {
                     let is_dir = full_path
-                        .symlink_metadata() // Don't follow symlinks
+                        .symlink_metadata()
                         .map(|meta| meta.file_type().is_dir())
                         .unwrap_or(false);
                     if is_dir {
@@ -93,7 +124,6 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
         }
     }
 
-    // Save mtimes of all affected parent directories that DON'T have explicit changes
     let mut saved_dir_mtimes: HashMap<PathBuf, (i64, u32)> = HashMap::new();
     for dir_path in &affected_parent_dirs {
         if !dirs_with_explicit_changes.contains(dir_path) {
@@ -105,54 +135,57 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
             }
         }
     }
+    saved_dir_mtimes
+}
 
-    // Separate changes into deletions, additions, and modifications
-    let mut deletions: Vec<&(Change, Option<Vec<u8>>)> = Vec::new();
-    let mut additions_and_modifications: Vec<&(Change, Option<Vec<u8>>)> = Vec::new();
-    let mut dir_metadata_changes: Vec<(&Change, &Metadata)> = Vec::new();
-
-    for item in &all_changes {
-        match &item.0.kind {
-            ChangeKind::Removed(_) => deletions.push(item),
-            ChangeKind::Added(_) | ChangeKind::Modified(_) => {
-                additions_and_modifications.push(item)
-            }
-        }
-    }
-
-    // Deletions (deepest paths first)
-    deletions.sort_by(|a, b| b.0.path.depth().cmp(&a.0.path.depth()));
+/// Apply all deletion changes (deepest paths first). Returns (delete_count, err_count).
+fn apply_deletions(all_changes: &[(Change, Option<Vec<u8>>)], root_dir: &Path) -> (usize, usize) {
+    let mut deletions: Vec<&Change> = all_changes
+        .iter()
+        .filter(|(c, _)| matches!(c.kind, ChangeKind::Removed(_)))
+        .map(|(c, _)| c)
+        .collect();
+    deletions.sort_by(|a, b| b.path.depth().cmp(&a.path.depth()));
 
     let mut delete_count = 0;
     let mut err_count = 0;
-    for (change, _) in deletions {
-        let full_path = change.path.to_full_path(&root_dir);
-        match &change.kind {
-            ChangeKind::Removed(entry_kind) => {
-                let result = match entry_kind {
-                    EntryKind::Directory => fs::remove_dir(&full_path),
-                    EntryKind::File | EntryKind::Symlink => fs::remove_file(&full_path),
-                };
-                match result {
-                    Ok(_) => delete_count += 1,
-                    Err(e) => {
-                        err_count += 1;
-                        warn!("Failed to delete {}: {}", full_path.display(), e);
-                    }
+    for change in deletions {
+        let full_path = change.path.to_full_path(root_dir);
+        if let ChangeKind::Removed(entry_kind) = &change.kind {
+            let result = match entry_kind {
+                EntryKind::Directory => fs::remove_dir(&full_path),
+                EntryKind::File | EntryKind::Symlink => fs::remove_file(&full_path),
+            };
+            match result {
+                Ok(_) => delete_count += 1,
+                Err(e) => {
+                    err_count += 1;
+                    warn!("Failed to delete {}: {}", full_path.display(), e);
                 }
             }
-            _ => unreachable!(),
         }
     }
+    (delete_count, err_count)
+}
 
-    // Additions and modifications (shallow first)
-    additions_and_modifications.sort_by(|a, b| a.0.path.depth().cmp(&b.0.path.depth()));
+/// Apply all addition and modification changes (shallowest paths first).
+fn apply_additions_and_modifications(
+    all_changes: &[(Change, Option<Vec<u8>>)],
+    root_dir: &Path,
+) -> ApplyResult {
+    let mut items: Vec<&(Change, Option<Vec<u8>>)> = all_changes
+        .iter()
+        .filter(|(c, _)| matches!(c.kind, ChangeKind::Added(_) | ChangeKind::Modified(_)))
+        .collect();
+    items.sort_by(|a, b| a.0.path.depth().cmp(&b.0.path.depth()));
 
     let mut add_count = 0;
     let mut mod_count = 0;
+    let mut err_count = 0;
+    let mut dir_metadata_changes: Vec<(RelativePath, Metadata)> = Vec::new();
 
-    for (change, content) in &additions_and_modifications {
-        let full_path = change.path.to_full_path(&root_dir);
+    for (change, content) in &items {
+        let full_path = change.path.to_full_path(root_dir);
         match &change.kind {
             ChangeKind::Added(added) => {
                 match added.entry.kind {
@@ -163,7 +196,8 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
                             continue;
                         }
                         set_metadata(&full_path, &added.entry.metadata);
-                        dir_metadata_changes.push((change, &added.entry.metadata));
+                        dir_metadata_changes
+                            .push((change.path.clone(), added.entry.metadata.clone()));
                     }
                     EntryKind::File => {
                         if let Some(content) = content {
@@ -220,7 +254,7 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
                     } else {
                         set_metadata(&full_path, new_metadata);
                         if file_type.map_or(false, |ft| ft.is_dir()) {
-                            dir_metadata_changes.push((change, new_metadata));
+                            dir_metadata_changes.push((change.path.clone(), new_metadata.clone()));
                         }
                     }
                 }
@@ -230,15 +264,29 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
         }
     }
 
-    // Set directory mtimes for directories with explicit changes (deepest paths first)
-    dir_metadata_changes.sort_by(|a, b| b.0.path.depth().cmp(&a.0.path.depth()));
-    for (change, metadata) in &dir_metadata_changes {
-        let full_path = change.path.to_full_path(&root_dir);
+    ApplyResult {
+        add_count,
+        mod_count,
+        err_count,
+        dir_metadata_changes,
+    }
+}
+
+/// Set directory mtimes: first for dirs with explicit changes (deepest first),
+/// then restore saved parent dir mtimes (deepest first).
+fn restore_directory_mtimes(
+    dir_metadata_changes: &[(RelativePath, Metadata)],
+    saved_dir_mtimes: HashMap<PathBuf, (i64, u32)>,
+    root_dir: &Path,
+) {
+    let mut sorted_explicit: Vec<&(RelativePath, Metadata)> = dir_metadata_changes.iter().collect();
+    sorted_explicit.sort_by(|a, b| b.0.depth().cmp(&a.0.depth()));
+    for (path, metadata) in sorted_explicit {
+        let full_path = path.to_full_path(root_dir);
         set_mtime(&full_path, metadata.mtime_sec, metadata.mtime_nsec);
     }
 
-    // Restore mtimes for directories NOT in the diff (deepest path first)
-    let mut saved_dirs = saved_dir_mtimes.into_iter().collect::<Vec<_>>();
+    let mut saved_dirs: Vec<_> = saved_dir_mtimes.into_iter().collect();
     saved_dirs.sort_by(|a, b| {
         let depth_a = a.0.components().count();
         let depth_b = b.0.components().count();
@@ -247,15 +295,6 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     for (dir_path, (mtime_sec, mtime_nsec)) in &saved_dirs {
         set_mtime(dir_path, *mtime_sec, *mtime_nsec);
     }
-    eprintln!("Apply complete:");
-    eprintln!("  Added: {}", add_count);
-    eprintln!("  Modified: {}", mod_count);
-    eprintln!("  Deleted: {}", delete_count);
-    if err_count > 0 {
-        eprintln!("  Errors: {}", err_count);
-    }
-
-    Ok(())
 }
 
 /// Set metadata for a file or directory
