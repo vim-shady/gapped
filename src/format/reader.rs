@@ -1,14 +1,11 @@
 use crate::error::{GappedError, Result};
 use crate::format::header::{FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
-use crate::model::diff::Change;
-use crate::model::entry::Entry;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 
-/// Record read from binary format
-pub enum Record {
-    SnapshotEntry(Entry),
-    DiffChange(Change),
-    FileContent(Vec<u8>),
+/// Header of a record
+pub struct RecordHeader {
+    pub record_type: RecordType,
+    pub payload_len: u64,
 }
 
 /// Streaming reader for gapped file format
@@ -69,17 +66,17 @@ impl FormatReader {
         ))
     }
 
-    /// Read the next record. Retruns `None` if the end of the file has been reached.
-    pub fn next_record(&mut self) -> Result<Option<Record>> {
+    /// Read the next record header. Returns `None` at end-of-records (EOR).
+    /// After calling this, one must consume the payload via `read_payload`,
+    /// `skip_payload`, or `copy_payload_to` before calling this again.
+    pub fn next_record_header(&mut self) -> Result<Option<RecordHeader>> {
         if self.finished {
             return Ok(None);
         }
 
-        // Read record length
+        // Read record length + type byte
         let mut len_bytes = [0u8; 8];
         self.inner.read_exact(&mut len_bytes)?;
-
-        // Read type byte
         let mut type_byte = [0u8; 1];
         self.inner.read_exact(&mut type_byte)?;
 
@@ -102,42 +99,46 @@ impl FormatReader {
             self.finished = true;
             return Ok(None);
         }
+
         let record_type = RecordType::from_u8(type_byte[0]).ok_or_else(|| {
             GappedError::InvalidFormat(format!("Unknown record type: {:?}", type_byte[0]))
         })?;
+        let payload_len = u64::from_le_bytes(len_bytes);
 
-        let payload_len = u64::from_le_bytes(len_bytes) as usize;
-
-        // Update hashser with length + type
         self.hasher.update(&len_bytes);
         self.hasher.update(&type_byte);
 
-        // Read payload
-        let mut payload = vec![0u8; payload_len];
-        self.inner.read_exact(&mut payload)?;
-        self.hasher.update(&payload);
-
-        let record = match record_type {
-            RecordType::SnapshotEntry => {
-                let entry: Entry = rmp_serde::from_slice(&payload)?;
-                Record::SnapshotEntry(entry)
-            }
-            RecordType::DiffChange => {
-                let change: Change = rmp_serde::from_slice(&payload)?;
-                Record::DiffChange(change)
-            }
-            RecordType::FileContent => Record::FileContent(payload),
-        };
-
-        Ok(Some(record))
+        Ok(Some(RecordHeader {
+            record_type,
+            payload_len,
+        }))
     }
 
-    pub fn read_all_records(&mut self) -> Result<Vec<Record>> {
-        let mut records = Vec::new();
-        while let Some(record) = self.next_record()? {
-            records.push(record);
+    /// Read a payload into memory and update the hasher.
+    pub fn read_payload(&mut self, len: u64) -> Result<Vec<u8>> {
+        let mut payload = vec![0u8; len as usize];
+        self.inner.read_exact(&mut payload)?;
+        self.hasher.update(&payload);
+        Ok(payload)
+    }
+
+    /// Skip a payload without materializing it.
+    pub fn skip_payload(&mut self, len: u64) -> Result<()> {
+        self.copy_payload_to(len, &mut std::io::sink())
+    }
+
+    /// Stream a payload to a writer without materializing it and update the hasher.
+    pub fn copy_payload_to<W: Write>(&mut self, len: u64, dest: &mut W) -> Result<()> {
+        let mut buf = [0u8; 64 * 1024];
+        let mut remaining = len;
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            self.inner.read_exact(&mut buf[..to_read])?;
+            self.hasher.update(&buf[..to_read]);
+            dest.write_all(&buf[..to_read])?;
+            remaining -= to_read as u64;
         }
-        Ok(records)
+        Ok(())
     }
 
     fn hex_encode(bytes: &[u8]) -> String {

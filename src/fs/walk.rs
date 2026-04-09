@@ -119,23 +119,21 @@ pub fn walk_filesystem(
             }
 
             // Check if we can reuse an old hash
-            if let Some(prev) = previous_entries {
-                if let Some(prev_entry) = prev.get(rel_path) {
-                    if prev_entry.kind == EntryKind::File
-                        && prev_entry.metadata.size_and_mtime_match(metadata)
-                    {
-                        return (
-                            Some(Entry {
-                                path: rel_path.clone(),
-                                kind: *kind,
-                                metadata: metadata.clone(),
-                                hash: prev_entry.hash,
-                                symlink_target: None,
-                            }),
-                            HashOutcome::Reused,
-                        );
-                    }
-                }
+            if let Some(prev) = previous_entries
+                && let Some(prev_entry) = prev.get(rel_path)
+                && prev_entry.kind == EntryKind::File
+                && prev_entry.metadata.size_and_mtime_match(metadata)
+            {
+                return (
+                    Some(Entry {
+                        path: rel_path.clone(),
+                        kind: *kind,
+                        metadata: metadata.clone(),
+                        hash: prev_entry.hash,
+                        symlink_target: None,
+                    }),
+                    HashOutcome::Reused,
+                );
             }
 
             let full_path = rel_path.to_full_path(&root_owned);

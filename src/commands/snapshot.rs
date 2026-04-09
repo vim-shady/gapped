@@ -1,6 +1,6 @@
 use crate::error::Result;
-use crate::format::header::FileHeader;
-use crate::format::reader::{FormatReader, Record};
+use crate::format::header::{FileHeader, RecordType};
+use crate::format::reader::FormatReader;
 use crate::format::writer::FormatWriter;
 use crate::fs::walk::walk_filesystem;
 use crate::model::entry::Entry;
@@ -17,14 +17,16 @@ pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
     let reader = std::io::BufReader::new(file);
     let (mut format_reader, header) = FormatReader::new(reader)?;
 
-    let entries = format_reader
-        .read_all_records()?
-        .into_iter()
-        .filter_map(|r| match r {
-            Record::SnapshotEntry(entry) => Some(entry),
-            _ => None,
-        })
-        .collect();
+    let mut entries = Vec::new();
+    while let Some(h) = format_reader.next_record_header()? {
+        if h.record_type == RecordType::SnapshotEntry {
+            let payload = format_reader.read_payload(h.payload_len)?;
+            let entry: Entry = rmp_serde::from_slice(&payload)?;
+            entries.push(entry);
+        } else {
+            format_reader.skip_payload(h.payload_len)?;
+        }
+    }
 
     Ok((entries, header))
 }

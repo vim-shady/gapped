@@ -1,14 +1,12 @@
+use crate::commands::apply::parse_diff_metadata;
 use crate::commands::snapshot::load_snapshot_entries;
 use crate::error::{GappedError, Result};
-use crate::format::reader::{FormatReader, Record};
 use crate::fs::walk::walk_filesystem;
 use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::Entry;
 use crate::model::path::RelativePath;
 use log::info;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 
 /// Execute the verify command.
@@ -28,7 +26,7 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
         .map(|entry| (entry.path.clone(), entry))
         .collect();
 
-    let changes = parse_diff_changes(diff_files)?;
+    let changes = parse_diff_metadata(diff_files)?;
     info!("Simulating applying diff ({} changes)", changes.len());
     simulate_changes(&mut simulated, &changes);
 
@@ -46,32 +44,8 @@ pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -
     }
 }
 
-/// Load and parse all diff change records from the given files (ignoring file content).
-fn parse_diff_changes(diff_files: &[&Path]) -> Result<Vec<Change>> {
-    let mut all_changes: Vec<Change> = Vec::new();
-
-    for diff_path in diff_files {
-        info!("Loading diff from {}", diff_path.display());
-        let file = File::open(diff_path)?;
-        let reader = BufReader::new(file);
-        let (mut format_reader, _header) = FormatReader::new(reader)?;
-
-        let records = format_reader.read_all_records()?;
-        for record in records {
-            if let Record::DiffChange(change) = record {
-                all_changes.push(change);
-            }
-        }
-    }
-
-    Ok(all_changes)
-}
-
 /// Apply changes to the simulated entry map (in-memory simulation of apply).
-fn simulate_changes(
-    simulated: &mut HashMap<RelativePath, Entry>,
-    changes: &[Change],
-) {
+fn simulate_changes(simulated: &mut HashMap<RelativePath, Entry>, changes: &[Change]) {
     for change in changes {
         match &change.kind {
             ChangeKind::Removed(_) => {

@@ -739,7 +739,8 @@ mod tests {
 
     use crate::commands::apply::detect_diff_files;
     use crate::commands::snapshot::run_snapshot;
-    use crate::format::reader::{FormatReader, Record};
+    use crate::format::header::RecordType;
+    use crate::format::reader::FormatReader;
     use std::fs;
     use std::io::BufReader;
     use tempfile::TempDir;
@@ -751,10 +752,11 @@ mod tests {
             let file = File::open(chunk).unwrap();
             let reader = BufReader::new(file);
             let (mut fr, _header) = FormatReader::new(reader).unwrap();
-            for record in fr.read_all_records().unwrap() {
-                if matches!(record, Record::DiffChange(_)) {
+            while let Some(header) = fr.next_record_header().unwrap() {
+                if header.record_type == RecordType::DiffChange {
                     total += 1;
                 }
+                fr.skip_payload(header.payload_len).unwrap();
             }
         }
         total

@@ -1,5 +1,6 @@
 use crate::error::{GappedError, Result};
-use crate::format::reader::{FormatReader, Record};
+use crate::format::header::RecordType;
+use crate::format::reader::FormatReader;
 use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::{EntryKind, Metadata};
 use crate::model::path::RelativePath;
@@ -19,20 +20,33 @@ struct ApplyResult {
     dir_metadata_changes: Vec<(RelativePath, Metadata)>,
 }
 
+struct StreamResult {
+    add_count: usize,
+    mod_count: usize,
+    err_count: usize,
+}
+
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
-    let all_changes = parse_diff_files(diff_files)?;
-    info!("Applying {} changes", all_changes.len());
 
-    let saved_dir_mtimes = save_parent_dir_mtimes(&all_changes, &root_dir);
-    let (del_count, mut err_count) = apply_deletions(&all_changes, &root_dir);
-    let result = apply_additions_and_modifications(&all_changes, &root_dir);
-    err_count += result.err_count;
-    restore_directory_mtimes(&result.dir_metadata_changes, saved_dir_mtimes, &root_dir);
+    // collect metadata, apply deletions and non-content changes
+    let changes = parse_diff_metadata(diff_files)?;
+    info!("Applying {} changes", changes.len());
+    
+    let saved_dir_mtimes = save_parent_dir_mtimes(&changes, &root_dir);
+    let (del_count, mut err_count) = apply_deletions(&changes, &root_dir);
+    let first_pass = apply_non_content_changes(&changes, &root_dir);
+    err_count += first_pass.err_count;
+
+    // stream file content directly to disk
+    let second_pass = stream_file_contents(diff_files, &root_dir)?;
+    err_count += second_pass.err_count;
+
+    restore_directory_mtimes(&first_pass.dir_metadata_changes, saved_dir_mtimes, &root_dir);
 
     eprintln!("Apply complete:");
-    eprintln!("  Added: {}", result.add_count);
-    eprintln!("  Modified: {}", result.mod_count);
+    eprintln!("  Added: {}", first_pass.add_count + second_pass.add_count);
+    eprintln!("  Modified: {}", first_pass.mod_count + second_pass.mod_count);
     eprintln!("  Deleted: {}", del_count);
     if err_count > 0 {
         eprintln!("  Errors: {}", err_count);
@@ -40,49 +54,26 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     Ok(())
 }
 
-/// Read all diff files and pair each change record with its file content (if any).
-fn parse_diff_files(diff_files: &[&Path]) -> Result<Vec<(Change, Option<Vec<u8>>)>> {
-    let mut all_changes: Vec<(Change, Option<Vec<u8>>)> = Vec::new();
+/// Read all diff files and collect change metadata, skipping file content payloads.
+pub fn parse_diff_metadata(diff_files: &[&Path]) -> Result<Vec<Change>> {
+    let mut all_changes: Vec<Change> = Vec::new();
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
         let reader = BufReader::new(file);
         let (mut format_reader, _header) = FormatReader::new(reader)?;
 
-        let records = format_reader.read_all_records()?;
-
-        let mut pending_change: Option<Change> = None;
-        for record in records {
-            match record {
-                Record::DiffChange(change) => {
-                    if let Some(previous_change) = pending_change.take() {
-                        all_changes.push((previous_change, None));
-                    }
-                    let has_content = match &change.kind {
-                        ChangeKind::Added(added) => added.has_content,
-                        ChangeKind::Modified(modified) => modified.has_content,
-                        ChangeKind::Removed(_) => false,
-                    };
-                    if has_content {
-                        pending_change = Some(change);
-                    } else {
-                        all_changes.push((change, None));
-                    }
+        while let Some(header) = format_reader.next_record_header()? {
+            match header.record_type {
+                RecordType::DiffChange => {
+                    let payload = format_reader.read_payload(header.payload_len)?;
+                    let change: Change = rmp_serde::from_slice(&payload)?;
+                    all_changes.push(change);
                 }
-                Record::FileContent(content) => {
-                    if let Some(change) = pending_change.take() {
-                        all_changes.push((change, Some(content)));
-                    } else {
-                        warn!("Unexpected FileContent record without preceding change");
-                    }
-                }
-                Record::SnapshotEntry(_) => {
-                    warn!("Unexpected SnapshotEntry in diff file");
+                _ => {
+                    format_reader.skip_payload(header.payload_len)?;
                 }
             }
-        }
-        if let Some(change) = pending_change.take() {
-            all_changes.push((change, None));
         }
     }
 
@@ -91,14 +82,11 @@ fn parse_diff_files(diff_files: &[&Path]) -> Result<Vec<(Change, Option<Vec<u8>>
 
 /// Save mtimes of parent directories that will be implicitly touched by file operations
 /// but don't have explicit metadata changes in the diff.
-fn save_parent_dir_mtimes(
-    all_changes: &[(Change, Option<Vec<u8>>)],
-    root_dir: &Path,
-) -> HashMap<PathBuf, (i64, u32)> {
+fn save_parent_dir_mtimes(all_changes: &[Change], root_dir: &Path) -> HashMap<PathBuf, (i64, u32)> {
     let mut dirs_with_explicit_changes: HashSet<PathBuf> = HashSet::new();
     let mut affected_parent_dirs: HashSet<PathBuf> = HashSet::new();
 
-    for (change, _) in all_changes {
+    for change in all_changes {
         let full_path = change.path.to_full_path(root_dir);
 
         if let Some(parent_dir) = full_path.parent() {
@@ -126,24 +114,21 @@ fn save_parent_dir_mtimes(
 
     let mut saved_dir_mtimes: HashMap<PathBuf, (i64, u32)> = HashMap::new();
     for dir_path in &affected_parent_dirs {
-        if !dirs_with_explicit_changes.contains(dir_path) {
-            if let Ok(meta) = dir_path.symlink_metadata() {
-                if meta.file_type().is_dir() {
-                    saved_dir_mtimes
-                        .insert(dir_path.clone(), (meta.mtime(), meta.mtime_nsec() as u32));
-                }
-            }
+        if !dirs_with_explicit_changes.contains(dir_path)
+            && let Ok(meta) = dir_path.symlink_metadata()
+            && meta.file_type().is_dir()
+        {
+            saved_dir_mtimes.insert(dir_path.clone(), (meta.mtime(), meta.mtime_nsec() as u32));
         }
     }
     saved_dir_mtimes
 }
 
 /// Apply all deletion changes (deepest paths first). Returns (delete_count, err_count).
-fn apply_deletions(all_changes: &[(Change, Option<Vec<u8>>)], root_dir: &Path) -> (usize, usize) {
+fn apply_deletions(all_changes: &[Change], root_dir: &Path) -> (usize, usize) {
     let mut deletions: Vec<&Change> = all_changes
         .iter()
-        .filter(|(c, _)| matches!(c.kind, ChangeKind::Removed(_)))
-        .map(|(c, _)| c)
+        .filter(|c| matches!(c.kind, ChangeKind::Removed(_)))
         .collect();
     deletions.sort_by(|a, b| b.path.depth().cmp(&a.path.depth()));
 
@@ -168,23 +153,21 @@ fn apply_deletions(all_changes: &[(Change, Option<Vec<u8>>)], root_dir: &Path) -
     (delete_count, err_count)
 }
 
-/// Apply all addition and modification changes (shallowest paths first).
-fn apply_additions_and_modifications(
-    all_changes: &[(Change, Option<Vec<u8>>)],
-    root_dir: &Path,
-) -> ApplyResult {
-    let mut items: Vec<&(Change, Option<Vec<u8>>)> = all_changes
+/// Apply additions and modifications that don't require file content (directories,
+/// symlinks, metadata-only changes). File content writes are handled by `stream_file_contents`.
+fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyResult {
+    let mut items: Vec<&Change> = all_changes
         .iter()
-        .filter(|(c, _)| matches!(c.kind, ChangeKind::Added(_) | ChangeKind::Modified(_)))
+        .filter(|c| matches!(c.kind, ChangeKind::Added(_) | ChangeKind::Modified(_)))
         .collect();
-    items.sort_by(|a, b| a.0.path.depth().cmp(&b.0.path.depth()));
+    items.sort_by(|a, b| a.path.depth().cmp(&b.path.depth()));
 
     let mut add_count = 0;
     let mut mod_count = 0;
     let mut err_count = 0;
     let mut dir_metadata_changes: Vec<(RelativePath, Metadata)> = Vec::new();
 
-    for (change, content) in &items {
+    for change in &items {
         let full_path = change.path.to_full_path(root_dir);
         match &change.kind {
             ChangeKind::Added(added) => {
@@ -198,16 +181,13 @@ fn apply_additions_and_modifications(
                         set_metadata(&full_path, &added.entry.metadata);
                         dir_metadata_changes
                             .push((change.path.clone(), added.entry.metadata.clone()));
+                        add_count += 1;
+                    }
+                    EntryKind::File if added.has_content => {
+                        // Skip
                     }
                     EntryKind::File => {
-                        if let Some(content) = content {
-                            if let Err(e) = write_file_atomic(&full_path, content) {
-                                warn!("Failed to write file {}: {}", full_path.display(), e);
-                                err_count += 1;
-                                continue;
-                            }
-                        }
-                        set_metadata(&full_path, &added.entry.metadata);
+                        add_count += 1;
                     }
                     EntryKind::Symlink => {
                         if let Some(target) = &added.entry.symlink_target {
@@ -223,19 +203,14 @@ fn apply_additions_and_modifications(
                                 added.entry.metadata.mtime_nsec,
                             );
                         }
+                        add_count += 1;
                     }
                 }
-                add_count += 1;
             }
             ChangeKind::Modified(modified) => {
                 if modified.has_content {
-                    if let Some(content) = content {
-                        if let Err(e) = write_file_atomic(&full_path, content) {
-                            warn!("Failed to write file {}: {}", full_path.display(), e);
-                            err_count += 1;
-                            continue;
-                        }
-                    }
+                    // Skip
+                    continue;
                 }
                 if let Some(new_target) = &modified.new_symlink_target {
                     let _ = fs::remove_file(&full_path);
@@ -245,15 +220,14 @@ fn apply_additions_and_modifications(
                         continue;
                     }
                 }
-
                 if let Some(new_metadata) = &modified.new_metadata {
                     let file_type = full_path.symlink_metadata().map(|m| m.file_type()).ok();
-                    if file_type.map_or(false, |ft| ft.is_symlink()) {
+                    if file_type.is_some_and(|ft| ft.is_symlink()) {
                         set_symlink_ownership(&full_path, new_metadata);
                         set_mtime(&full_path, new_metadata.mtime_sec, new_metadata.mtime_nsec);
                     } else {
                         set_metadata(&full_path, new_metadata);
-                        if file_type.map_or(false, |ft| ft.is_dir()) {
+                        if file_type.is_some_and(|ft| ft.is_dir()) {
                             dir_metadata_changes.push((change.path.clone(), new_metadata.clone()));
                         }
                     }
@@ -270,6 +244,103 @@ fn apply_additions_and_modifications(
         err_count,
         dir_metadata_changes,
     }
+}
+
+/// Re-open diff files and stream file content directly to disk.
+fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamResult> {
+    let mut add_count = 0;
+    let mut mod_count = 0;
+    let mut err_count = 0;
+
+    for diff_path in diff_files {
+        let file = File::open(diff_path)?;
+        let reader = BufReader::new(file);
+        let (mut format_reader, _header) = FormatReader::new(reader)?;
+
+        let mut pending_change: Option<Change> = None;
+        while let Some(header) = format_reader.next_record_header()? {
+            match header.record_type {
+                RecordType::DiffChange => {
+                    let payload = format_reader.read_payload(header.payload_len)?;
+                    let change: Change = rmp_serde::from_slice(&payload)?;
+                    let has_content = match &change.kind {
+                        ChangeKind::Added(added) => added.has_content,
+                        ChangeKind::Modified(modified) => modified.has_content,
+                        ChangeKind::Removed(_) => false,
+                    };
+                    pending_change = if has_content { Some(change) } else { None };
+                }
+                RecordType::FileContent => {
+                    if let Some(change) = pending_change.take() {
+                        if write_streamed_file(
+                            &change,
+                            &mut format_reader,
+                            header.payload_len,
+                            root_dir,
+                        )? {
+                            match &change.kind {
+                                ChangeKind::Added(_) => add_count += 1,
+                                ChangeKind::Modified(_) => mod_count += 1,
+                                _ => {}
+                            }
+                        } else {
+                            err_count += 1;
+                        }
+                    } else {
+                        warn!("Unexpected FileContent record without preceding change");
+                        format_reader.skip_payload(header.payload_len)?;
+                    }
+                }
+                _ => {
+                    format_reader.skip_payload(header.payload_len)?;
+                }
+            }
+        }
+    }
+
+    Ok(StreamResult {
+        add_count,
+        mod_count,
+        err_count,
+    })
+}
+
+/// Write a single streamed file to disk via temp file + atomic rename.
+fn write_streamed_file(
+    change: &Change,
+    format_reader: &mut FormatReader,
+    payload_len: u64,
+    root_dir: &Path,
+) -> Result<bool> {
+    let full_path = change.path.to_full_path(root_dir);
+    let parent = full_path.parent().unwrap_or(Path::new("."));
+    let mut temp = match tempfile::NamedTempFile::new_in(parent) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                "Failed to create temp file for {}: {}",
+                full_path.display(),
+                e
+            );
+            format_reader.skip_payload(payload_len)?;
+            return Ok(false);
+        }
+    };
+    format_reader.copy_payload_to(payload_len, &mut temp)?;
+    if let Err(e) = temp.persist(&full_path) {
+        warn!("Failed to persist file {}: {}", full_path.display(), e);
+        return Ok(false);
+    }
+    match &change.kind {
+        ChangeKind::Added(added) => set_metadata(&full_path, &added.entry.metadata),
+        ChangeKind::Modified(modified) => {
+            if let Some(new_metadata) = &modified.new_metadata {
+                set_metadata(&full_path, new_metadata);
+            }
+        }
+        _ => {}
+    }
+    Ok(true)
 }
 
 /// Set directory mtimes: first for dirs with explicit changes (deepest first),
@@ -329,15 +400,6 @@ fn set_mtime(path: &Path, mtime_sec: i64, mtime_nsec: u32) {
     {
         warn!("Failed to set mtime for {}: {}", path.display(), e);
     }
-}
-
-/// Write file conent atomically using a temp file + rename
-fn write_file_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut temp, content)?;
-    temp.persist(path)?;
-    Ok(())
 }
 
 /// Set ownership on a symlink (lchown)
