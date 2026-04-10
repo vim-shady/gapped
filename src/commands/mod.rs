@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod diff;
+pub mod simulate;
 pub mod snapshot;
 pub mod verify;
 

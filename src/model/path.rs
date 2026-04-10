@@ -43,6 +43,11 @@ impl RelativePath {
     pub fn depth(&self) -> usize {
         self.0.components().count()
     }
+
+    /// Return the parent of this path, or `None` if this path is already the root.
+    pub fn parent(&self) -> Option<RelativePath> {
+        self.0.parent().map(|p| RelativePath(p.to_path_buf()))
+    }
 }
 
 impl AsRef<Path> for RelativePath {
@@ -54,5 +59,30 @@ impl AsRef<Path> for RelativePath {
 impl fmt::Display for RelativePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_of_top_level_is_root() {
+        let p = RelativePath::new(Path::new("a.txt")).unwrap();
+        assert_eq!(p.parent(), Some(RelativePath::root()));
+    }
+
+    #[test]
+    fn parent_of_nested_strips_last_component() {
+        let p = RelativePath::new(Path::new("a/b/c.txt")).unwrap();
+        assert_eq!(
+            p.parent(),
+            Some(RelativePath::new(Path::new("a/b")).unwrap())
+        );
+    }
+
+    #[test]
+    fn parent_of_root_is_none() {
+        assert_eq!(RelativePath::root().parent(), None);
     }
 }
