@@ -5,7 +5,6 @@ use crate::model::entry::{Entry, EntryKind};
 use crate::model::path::RelativePath;
 use log::{info, warn};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use std::collections::HashMap;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -20,10 +19,14 @@ pub struct WalkStats {
     pub files_hash_reused: usize,
     pub errors: usize,
 }
-/// Walk the filesystem under 'root' and return a sorted list of entries
+/// Walk the filesystem under 'root' and return a sorted list of entries.
+///
+/// `previous_entries` must be sorted by path (the invariant held by snapshots
+/// loaded via `load_snapshot`). It's looked up via binary search to reuse
+/// content hashes for files whose size+mtime haven't changed.
 pub fn walk_filesystem(
     root: &Path,
-    previous_entries: Option<&HashMap<RelativePath, Entry>>,
+    previous_entries: Option<&[Entry]>,
 ) -> Result<(Vec<Entry>, WalkStats)> {
     let mut stats = WalkStats::default();
 
@@ -120,20 +123,23 @@ pub fn walk_filesystem(
 
             // Check if we can reuse an old hash
             if let Some(prev) = previous_entries
-                && let Some(prev_entry) = prev.get(rel_path)
-                && prev_entry.kind == EntryKind::File
-                && prev_entry.metadata.size_and_mtime_match(metadata)
+                && let Ok(idx) = prev.binary_search_by(|e| e.path.cmp(rel_path))
             {
-                return (
-                    Some(Entry {
-                        path: rel_path.clone(),
-                        kind: *kind,
-                        metadata: metadata.clone(),
-                        hash: prev_entry.hash,
-                        symlink_target: None,
-                    }),
-                    HashOutcome::Reused,
-                );
+                let prev_entry = &prev[idx];
+                if prev_entry.kind == EntryKind::File
+                    && prev_entry.metadata.size_and_mtime_match(metadata)
+                {
+                    return (
+                        Some(Entry {
+                            path: rel_path.clone(),
+                            kind: *kind,
+                            metadata: metadata.clone(),
+                            hash: prev_entry.hash,
+                            symlink_target: None,
+                        }),
+                        HashOutcome::Reused,
+                    );
+                }
             }
 
             let full_path = rel_path.to_full_path(&root_owned);
@@ -245,14 +251,9 @@ mod tests {
         let tmp = setup_test_tree();
         let root = tmp.path();
 
-        let (entries, stats) = walk_filesystem(root, None).unwrap();
+        let (prev_entries, stats) = walk_filesystem(root, None).unwrap();
         assert_eq!(stats.files_hashed, 3);
         assert_eq!(stats.files_hash_reused, 0);
-
-        let prev_entries: HashMap<RelativePath, Entry> = entries
-            .into_iter()
-            .map(|entry| (entry.path.clone(), entry))
-            .collect();
 
         std::fs::write(root.join("top.txt"), "changed").unwrap();
 

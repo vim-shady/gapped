@@ -51,10 +51,11 @@ pub fn run_snapshot(
 ) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
 
-    // Load previous snapshot if provided
+    // Load previous snapshot if provided. The Vec is sorted by path, so walk
+    // can binary-search it directly.
     let previous_entries = if let Some(snapshot_in) = snapshot_in {
         info!("Loading previous snapshot from {}", snapshot_in.display());
-        let (entries, _header) = load_snapshot_entries(snapshot_in)?;
+        let (entries, _header) = load_snapshot(snapshot_in)?;
         info!("Loaded {} entries from previous snapshot", entries.len());
         Some(entries)
     } else {
@@ -63,7 +64,7 @@ pub fn run_snapshot(
 
     // Walk the file system
     info!("Walking filesystem under {}", root_dir.display());
-    let (entries, stats) = walk_filesystem(&root_dir, previous_entries.as_ref())?;
+    let (entries, stats) = walk_filesystem(&root_dir, previous_entries.as_deref())?;
 
     info!("Writing snapshot to {}", snapshot_out.display());
     let file = File::create(snapshot_out)?;

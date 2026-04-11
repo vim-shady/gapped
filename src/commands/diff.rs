@@ -27,17 +27,14 @@ pub fn run_diff(
             source: e,
         })?;
 
-    // Load the input snapshot once, derive both Vec and HashMap
+    // Load the input snapshot (sorted by path) so walk can binary-search it
+    // for hash reuse.
     info!("Loading input snapshot {}", snapshot_in.display());
     let (old_entries, _old_header) = crate::commands::snapshot::load_snapshot(snapshot_in)?;
-    let old_entries_map: std::collections::HashMap<_, _> = old_entries
-        .iter()
-        .map(|e| (e.path.clone(), e.clone()))
-        .collect();
 
     // Walk current filesystem
     info!("Walking filesystem under {}", root_dir.display());
-    let (new_entries, stats) = crate::fs::walk::walk_filesystem(&root_dir, Some(&old_entries_map))?;
+    let (new_entries, stats) = crate::fs::walk::walk_filesystem(&root_dir, Some(&old_entries))?;
 
     // Compute diff
     info!("Computing diff");
