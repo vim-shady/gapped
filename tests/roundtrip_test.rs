@@ -395,6 +395,70 @@ fn test_split_diff_roundtrip() {
     assert!(fixture.verify_rsync_identical());
 }
 
+/// A single file larger than split-size must be split across chunks
+/// and reassembled correctly by apply.
+#[test]
+fn test_large_file_split_across_chunks() {
+    let fixture = TestFixture::new();
+
+    let file_size = 100 * 1024;
+    fs::write(fixture.source().join("big.dat"), vec![b'A'; file_size]).unwrap();
+    create_file(&fixture.source().join("small.txt"), "keep me\n");
+
+    fixture.sync_source_to_target();
+
+    let target_snap = fixture.working_file("target_snap");
+    assert!(run_gapped(&[
+        "snapshot",
+        fixture.target().to_str().unwrap(),
+        target_snap.to_str().unwrap(),
+    ]));
+
+    // rewrite big.dat
+    thread::sleep(Duration::from_millis(1100));
+    let new_content: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
+    fs::write(fixture.source().join("big.dat"), &new_content).unwrap();
+
+    let diff_base = fixture.working_file("diff.gapped");
+    let snap2 = fixture.working_file("snap2");
+    assert!(run_gapped(&[
+        "diff",
+        fixture.source().to_str().unwrap(),
+        target_snap.to_str().unwrap(),
+        diff_base.to_str().unwrap(),
+        snap2.to_str().unwrap(),
+        "--split-size",
+        "20000", // 20 KB
+    ]));
+
+    // should have produced multiple chunks
+    let chunk1 = fixture.working_dir.path().join(format!(
+        "{}.001",
+        diff_base.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(chunk1.exists(), "expected at least one chunk");
+
+    // veryfy + apply
+    assert!(run_gapped(&[
+        "verify",
+        fixture.target().to_str().unwrap(),
+        diff_base.to_str().unwrap(),
+        snap2.to_str().unwrap(),
+    ]));
+
+    assert!(run_gapped(&[
+        "apply",
+        fixture.target().to_str().unwrap(),
+        diff_base.to_str().unwrap(),
+    ]));
+
+    assert!(fixture.verify_rsync_identical());
+
+    // Double-check content
+    let applied = fs::read(fixture.target().join("big.dat")).unwrap();
+    assert_eq!(applied, new_content);
+}
+
 #[test]
 fn test_permission_change() {
     let fixture = TestFixture::new();

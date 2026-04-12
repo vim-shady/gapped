@@ -32,7 +32,7 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     // collect metadata, apply deletions and non-content changes
     let changes = parse_diff_metadata(diff_files)?;
     info!("Applying {} changes", changes.len());
-    
+
     let saved_dir_mtimes = save_parent_dir_mtimes(&changes, &root_dir);
     let (del_count, mut err_count) = apply_deletions(&changes, &root_dir);
     let first_pass = apply_non_content_changes(&changes, &root_dir);
@@ -42,11 +42,18 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     let second_pass = stream_file_contents(diff_files, &root_dir)?;
     err_count += second_pass.err_count;
 
-    restore_directory_mtimes(&first_pass.dir_metadata_changes, saved_dir_mtimes, &root_dir);
+    restore_directory_mtimes(
+        &first_pass.dir_metadata_changes,
+        saved_dir_mtimes,
+        &root_dir,
+    );
 
     eprintln!("Apply complete:");
     eprintln!("  Added: {}", first_pass.add_count + second_pass.add_count);
-    eprintln!("  Modified: {}", first_pass.mod_count + second_pass.mod_count);
+    eprintln!(
+        "  Modified: {}",
+        first_pass.mod_count + second_pass.mod_count
+    );
     eprintln!("  Deleted: {}", del_count);
     if err_count > 0 {
         eprintln!("  Errors: {}", err_count);
@@ -246,21 +253,72 @@ fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyRe
     }
 }
 
+/// A file being assembled from one or more FileContent records.
+struct PendingFile {
+    change: Change,
+    temp: tempfile::NamedTempFile,
+}
+
+/// Persist a fully assembled pending file to its final path and apply metadata.
+fn finalize_pending_file(pf: PendingFile, root_dir: &Path) -> bool {
+    let PendingFile { change, temp } = pf;
+    let full_path = change.path.to_full_path(root_dir);
+    if let Err(e) = temp.persist(&full_path) {
+        warn!("Failed to persist file {}: {}", full_path.display(), e);
+        return false;
+    }
+    match &change.kind {
+        ChangeKind::Added(added) => set_metadata(&full_path, &added.entry.metadata),
+        ChangeKind::Modified(modified) => {
+            if let Some(new_metadata) = &modified.new_metadata {
+                set_metadata(&full_path, new_metadata);
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+/// If a pending file exists, finalize it and update the result counters.
+fn flush_pending(pending: &mut Option<PendingFile>, root_dir: &Path, result: &mut StreamResult) {
+    if let Some(pf) = pending.take() {
+        let is_add = matches!(&pf.change.kind, ChangeKind::Added(_));
+        if finalize_pending_file(pf, root_dir) {
+            if is_add {
+                result.add_count += 1;
+            } else {
+                result.mod_count += 1;
+            }
+        } else {
+            result.err_count += 1;
+        }
+    }
+}
+
 /// Re-open diff files and stream file content directly to disk.
+///
+/// Supports content split across multiple chunks: a `FileContent` record
+/// without a preceeding `DiffChange` in the current chunk is treated as a
+/// continuation of the file from the previous chunk.
 fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamResult> {
-    let mut add_count = 0;
-    let mut mod_count = 0;
-    let mut err_count = 0;
+    let mut result = StreamResult {
+        add_count: 0,
+        mod_count: 0,
+        err_count: 0,
+    };
+    // persists across chunk boundaries
+    let mut pending: Option<PendingFile> = None;
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
         let reader = BufReader::new(file);
         let (mut format_reader, _header) = FormatReader::new(reader)?;
 
-        let mut pending_change: Option<Change> = None;
         while let Some(header) = format_reader.next_record_header()? {
             match header.record_type {
                 RecordType::DiffChange => {
+                    flush_pending(&mut pending, root_dir, &mut result);
+
                     let payload = format_reader.read_payload(header.payload_len)?;
                     let change: Change = rmp_serde::from_slice(&payload)?;
                     let has_content = match &change.kind {
@@ -268,24 +326,27 @@ fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamR
                         ChangeKind::Modified(modified) => modified.has_content,
                         ChangeKind::Removed(_) => false,
                     };
-                    pending_change = if has_content { Some(change) } else { None };
+                    if has_content {
+                        let full_path = change.path.to_full_path(root_dir);
+                        let parent = full_path.parent().unwrap_or(Path::new("."));
+                        match tempfile::NamedTempFile::new_in(parent) {
+                            Ok(temp) => {
+                                pending = Some(PendingFile { change, temp });
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to create temp file for {}: {}",
+                                    full_path.display(),
+                                    e
+                                );
+                                result.err_count += 1;
+                            }
+                        }
+                    }
                 }
                 RecordType::FileContent => {
-                    if let Some(change) = pending_change.take() {
-                        if write_streamed_file(
-                            &change,
-                            &mut format_reader,
-                            header.payload_len,
-                            root_dir,
-                        )? {
-                            match &change.kind {
-                                ChangeKind::Added(_) => add_count += 1,
-                                ChangeKind::Modified(_) => mod_count += 1,
-                                _ => {}
-                            }
-                        } else {
-                            err_count += 1;
-                        }
+                    if let Some(ref mut pf) = pending {
+                        format_reader.copy_payload_to(header.payload_len, &mut pf.temp)?;
                     } else {
                         warn!("Unexpected FileContent record without preceding change");
                         format_reader.skip_payload(header.payload_len)?;
@@ -298,49 +359,8 @@ fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamR
         }
     }
 
-    Ok(StreamResult {
-        add_count,
-        mod_count,
-        err_count,
-    })
-}
-
-/// Write a single streamed file to disk via temp file + atomic rename.
-fn write_streamed_file(
-    change: &Change,
-    format_reader: &mut FormatReader,
-    payload_len: u64,
-    root_dir: &Path,
-) -> Result<bool> {
-    let full_path = change.path.to_full_path(root_dir);
-    let parent = full_path.parent().unwrap_or(Path::new("."));
-    let mut temp = match tempfile::NamedTempFile::new_in(parent) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(
-                "Failed to create temp file for {}: {}",
-                full_path.display(),
-                e
-            );
-            format_reader.skip_payload(payload_len)?;
-            return Ok(false);
-        }
-    };
-    format_reader.copy_payload_to(payload_len, &mut temp)?;
-    if let Err(e) = temp.persist(&full_path) {
-        warn!("Failed to persist file {}: {}", full_path.display(), e);
-        return Ok(false);
-    }
-    match &change.kind {
-        ChangeKind::Added(added) => set_metadata(&full_path, &added.entry.metadata),
-        ChangeKind::Modified(modified) => {
-            if let Some(new_metadata) = &modified.new_metadata {
-                set_metadata(&full_path, new_metadata);
-            }
-        }
-        _ => {}
-    }
-    Ok(true)
+    flush_pending(&mut pending, root_dir, &mut result);
+    Ok(result)
 }
 
 /// Set directory mtimes: first for dirs with explicit changes (deepest first),

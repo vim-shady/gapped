@@ -74,10 +74,12 @@ impl<W: Write> FormatWriter<W> {
         writer_inner.write_all(&header_bytes)?;
         hasher.update(&header_bytes);
 
+        let bytes_written =
+            magic.len() as u64 + header_len.len() as u64 + header_bytes.len() as u64;
         Ok(FormatWriter {
             inner: writer_inner,
             hasher,
-            bytes_written: 9, // magic
+            bytes_written,
         })
     }
 

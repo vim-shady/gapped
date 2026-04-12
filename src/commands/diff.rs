@@ -9,6 +9,9 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
+// FileContent record header: 8-byte length + 1-byte type tag
+const RECORD_HEADER: u64 = 9;
+
 pub fn run_diff(
     root_dir: &Path,
     snapshot_in: &Path,
@@ -108,7 +111,8 @@ fn write_snapshot(
     Ok(())
 }
 
-/// Write split diff files
+/// Write split diff files, splitting file content across chunks when a single
+/// file would exceed the split size budget.
 fn write_split_diff(
     diff_out: &Path,
     changes: &[Change],
@@ -117,34 +121,84 @@ fn write_split_diff(
     max_bytes: u64,
     compress: bool,
 ) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+
+    /// Create a new chunk writer for split diffs.
+    fn create_chunk_writer(
+        diff_out_str: &str,
+        chunk_number: u32,
+        source_snapshot_hash: [u8; 32],
+        compress: bool,
+    ) -> Result<FormatWriter<BufWriter<File>>> {
+        let path = format!("{}.{:03}", diff_out_str, chunk_number);
+        let file = File::create(&path)?;
+        let buf = BufWriter::new(file);
+        let header = FileHeader::diff(source_snapshot_hash, Some(chunk_number));
+        FormatWriter::maybe_compressed(buf, &header, compress)
+    }
+
+    /// Remaining content budget before the chunk reaches `max_bytes`.
+    fn content_budget<W: std::io::Write>(w: &FormatWriter<W>, max_bytes: u64) -> u64 {
+        max_bytes.saturating_sub(w.bytes_written() + RECORD_HEADER)
+    }
+
     let diff_out_str = diff_out.to_string_lossy();
     let mut chunk_number: u32 = 1;
-    let mut change_index = 0;
+    let mut writer =
+        create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
 
-    while change_index < changes.len() {
-        let chunk_path = format!("{}.{:03}", diff_out_str, chunk_number);
-        let file = File::create(&chunk_path)?;
-        let buf_writer = BufWriter::new(file);
+    let last_idx = changes.len() - 1;
+    for (i, change) in changes.iter().enumerate() {
+        writer.write_diff_change(change)?;
 
-        let header = FileHeader::diff(source_snapshot_hash, Some(chunk_number));
-        let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
+        let needs_content = matches!(&change.kind, ChangeKind::Added(a) if a.has_content)
+            || matches!(&change.kind, ChangeKind::Modified(m) if m.has_content);
 
-        // write changes until size limit
-        while change_index < changes.len() {
-            write_one_change(&mut writer, &changes[change_index], root_dir)?;
-            change_index += 1;
+        if needs_content {
+            let full_path = change.path.to_full_path(root_dir);
+            let file = File::open(&full_path).map_err(|e| GappedError::IoPath {
+                path: full_path.clone(),
+                source: e,
+            })?;
+            let mut remaining = file.metadata()?.len();
+            let mut reader = BufReader::new(file);
 
-            // check if size limit exceeded
-            if writer.bytes_written() >= max_bytes && change_index < changes.len() {
-                break;
+            while remaining > 0 {
+                let mut budget = content_budget(&writer, max_bytes);
+
+                if budget == 0 {
+                    writer.finish()?;
+                    chunk_number += 1;
+                    writer = create_chunk_writer(
+                        &diff_out_str,
+                        chunk_number,
+                        source_snapshot_hash,
+                        compress,
+                    )?;
+                    budget = content_budget(&writer, max_bytes);
+                }
+
+                // if max_bytes < chunk overhead write all
+                // remaining content to guarantee forward progress
+                let fragment = remaining.min(if budget > 0 { budget } else { remaining });
+                writer.write_file_content_from_reader(&mut reader, fragment)?;
+                remaining -= fragment;
             }
         }
 
-        writer.finish()?;
-        chunk_number += 1;
+        // start a fresh chunk for the next change if this one is full.
+        if i < last_idx && writer.bytes_written() >= max_bytes {
+            writer.finish()?;
+            chunk_number += 1;
+            writer =
+                create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
+        }
     }
 
-    info!("Wrote {} diff chunks", chunk_number - 1);
+    writer.finish()?;
+    info!("Wrote {} diff chunks", chunk_number);
     Ok(())
 }
 
