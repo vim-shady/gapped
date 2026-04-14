@@ -1,13 +1,13 @@
 use crate::error::{GappedError, Result};
-use crate::format::header::RecordType;
+use crate::format::header::{FileHeader, RecordType};
 use crate::format::reader::FormatReader;
-use crate::model::diff::{Change, ChangeKind};
+use crate::model::diff::{Change, ChangeKind, Diff};
 use crate::model::entry::{EntryKind, Metadata};
 use crate::model::path::RelativePath;
 use crossbeam_channel::{Receiver, Sender};
 use log::{info, warn};
 use nix::unistd::{Gid, Uid};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::{File, Permissions};
 use std::io::{BufReader, Write};
@@ -78,25 +78,39 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
     Ok(())
 }
 
-/// Read all diff files and collect change metadata, skipping file content payloads.
+fn check_diff_version(header: &FileHeader) -> Result<()> {
+    if header.file_type == "diff" && header.version != Diff::CURRENT_VERSION {
+        return Err(GappedError::InvalidFormat(format!(
+            "unsupported diff schema version {} (expected {}); regenerate with current gapped",
+            header.version,
+            Diff::CURRENT_VERSION,
+        )));
+    }
+    Ok(())
+}
+
+/// Read all diff files and collect change metadata. Stops at the first
+/// `FileContent` record in each chunk.
 pub fn parse_diff_metadata(diff_files: &[&Path]) -> Result<Vec<Change>> {
     let mut all_changes: Vec<Change> = Vec::new();
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
         let reader = BufReader::new(file);
-        let (mut format_reader, _header) = FormatReader::new(reader)?;
+        let (mut format_reader, header) = FormatReader::new(reader)?;
+        check_diff_version(&header)?;
 
-        while let Some(header) = format_reader.next_record_header()? {
-            match header.record_type {
+        while let Some(record) = format_reader.next_record_header()? {
+            match record.record_type {
                 RecordType::DiffChange => {
-                    let payload = format_reader.read_payload(header.payload_len)?;
+                    let payload = format_reader.read_payload(record.payload_len)?;
                     let change: Change = rmp_serde::from_slice(&payload)?;
                     all_changes.push(change);
                 }
-                _ => {
-                    format_reader.skip_payload(header.payload_len)?;
-                }
+                // section boundary: first FileContent marks the start of the
+                // content section. No further metadata records in this chunk.
+                RecordType::FileContent => break,
+                _ => format_reader.skip_payload(record.payload_len)?,
             }
         }
     }
@@ -272,13 +286,11 @@ fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyRe
 
 /// Re-open diff files and stream file content to disk in parallel.
 ///
-/// Reader (this thread) assembles each file's payload into a `Vec<u8>`,
-/// concatenating across multiple `FileContent` records when a large file is
+/// Reader assembles each file's payload into a `Vec<u8>`,
+/// concatenating across multiple `FileContent` records when a lrge file is
 /// split across chunks, and dispatches one `WriteJob` per file to a pool of
-/// worker threads via a bounded channel. Workers write the tempfile, rename,
+/// worker  threads via a bounded channel. Workers write the tempfile, rename,
 /// and apply metadata in parallel.
-///
-/// Memory bound: up to `N_workers * max_file_size` in-flight payloads.
 fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamResult> {
     let workers = thread::available_parallelism()
         .map(NonZeroUsize::get)
@@ -296,14 +308,13 @@ fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamR
         match h.join() {
             Ok(local) => total.merge(local),
             Err(_) => {
-                return Err(GappedError::ApplyWorkerFailure(
-                    "writer thread panicked",
-                ));
+                return Err(GappedError::ApplyWorkerFailure("writer thread panicked"));
             }
         }
     }
 
-    // surface reader error only after workers have joined, so threads don't get leaked after a reader erirr
+    // surface reader error only after workers have joined, so threads don't get leaked after
+    // a reader erirr
     read_res?;
     Ok(total)
 }
@@ -328,70 +339,123 @@ fn spawn_write_workers(
         .collect()
 }
 
+/// A content change whose `DiffChange` has been read but whose
+/// `FileContent` bytes are still being accumulated across one or more records.
+struct PendingContent {
+    change: Change,
+    buffer: Vec<u8>,
+    expected_size: u64,
+}
+
+impl PendingContent {
+    fn new(change: Change) -> Self {
+        let expected_size = expected_content_size(&change);
+        Self {
+            change,
+            buffer: Vec::with_capacity(expected_size as usize),
+            expected_size,
+        }
+    }
+}
+
 /// Read all diff chunks, assemble per-file payloads, and dispatch them to workers.
+///
+/// Wach chunk stores all `DiffChange` records first, then
+/// all `FileContent` records. Pairing is by position across the whole diff
+/// (not per chunk), such that content changes are queued as their DCs are
+/// read, then drained by incoming FC records. A single file may span multiple
+/// FC records — completion is detected by matching `buffer.len()` against the
+/// expected size drawn from the change metadata.
 fn read_diff_and_dispatch(diff_files: &[&Path], tx: &Sender<WriteJob>) -> Result<()> {
-    let mut pending_change: Option<Change> = None;
-    let mut pending_buf: Vec<u8> = Vec::new();
+    let mut queue: VecDeque<PendingContent> = VecDeque::new();
+    let mut current: Option<PendingContent> = None;
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
         let reader = BufReader::new(file);
-        let (mut format_reader, _header) = FormatReader::new(reader)?;
+        let (mut format_reader, header) = FormatReader::new(reader)?;
+        check_diff_version(&header)?;
 
-        while let Some(header) = format_reader.next_record_header()? {
-            match header.record_type {
+        while let Some(record) = format_reader.next_record_header()? {
+            match record.record_type {
                 RecordType::DiffChange => {
-                    dispatch_pending(&mut pending_change, &mut pending_buf, tx)?;
-
-                    let payload = format_reader.read_payload(header.payload_len)?;
+                    let payload = format_reader.read_payload(record.payload_len)?;
                     let change: Change = rmp_serde::from_slice(&payload)?;
-                    if change_has_content(&change) {
-                        pending_change = Some(change);
+                    if change.has_content() {
+                        queue.push_back(PendingContent::new(change));
                     }
                 }
                 RecordType::FileContent => {
-                    if pending_change.is_some() {
-                        // append this fragment to the in-memory buffer. Vec<u8>
-                        // implements Write, so copy_payload_to streams via the
-                        // reader's 64 KiB buffer directly into pending_buf.
-                        format_reader.copy_payload_to(header.payload_len, &mut pending_buf)?;
-                    } else {
-                        warn!("Unexpected FileContent record without preceding change");
-                        format_reader.skip_payload(header.payload_len)?;
-                    }
+                    read_content_fragment(
+                        &mut format_reader,
+                        record.payload_len,
+                        &mut current,
+                        &mut queue,
+                        tx,
+                    )?;
                 }
-                _ => {
-                    format_reader.skip_payload(header.payload_len)?;
-                }
+                _ => format_reader.skip_payload(record.payload_len)?,
             }
         }
     }
 
-    dispatch_pending(&mut pending_change, &mut pending_buf, tx)?;
+    if current.is_some() || !queue.is_empty() {
+        return Err(GappedError::InvalidFormat(
+            "diff ended with unresolved content records".into(),
+        ));
+    }
     Ok(())
 }
 
-fn change_has_content(change: &Change) -> bool {
-    match &change.kind {
-        ChangeKind::Added(added) => added.has_content,
-        ChangeKind::Modified(modified) => modified.has_content,
-        ChangeKind::Removed(_) => false,
-    }
-}
-
-/// If a pending change has accumulated content, send it as a `WriteJob` and reset state.
-fn dispatch_pending(
-    pending_change: &mut Option<Change>,
-    pending_buf: &mut Vec<u8>,
+/// Append one `FileContent`s bytes to the current pending file, starting
+/// a new one from the queue if none is active. Dispatches as soon as the
+/// acvumulated bytes match the expected size.
+fn read_content_fragment(
+    format_reader: &mut FormatReader,
+    payload_len: u64,
+    current: &mut Option<PendingContent>,
+    queue: &mut VecDeque<PendingContent>,
     tx: &Sender<WriteJob>,
 ) -> Result<()> {
-    if let Some(change) = pending_change.take() {
-        let payload = std::mem::take(pending_buf);
-        tx.send(WriteJob { change, payload }).map_err(|_| {
+    if current.is_none() {
+        match queue.pop_front() {
+            Some(pc) => *current = Some(pc),
+            None => {
+                warn!("FileContent record with no pending change; skipping");
+                format_reader.skip_payload(payload_len)?;
+                return Ok(());
+            }
+        }
+    }
+
+    let pc = current.as_mut().expect("set above");
+    format_reader.copy_payload_to(payload_len, &mut pc.buffer)?;
+
+    if pc.buffer.len() as u64 >= pc.expected_size {
+        let completed = current.take().expect("present above");
+        tx.send(WriteJob {
+            change: completed.change,
+            payload: completed.buffer,
+        })
+        .map_err(|_| {
             GappedError::ApplyWorkerFailure("worker pool terminated before reader finished")
         })?;
     }
     Ok(())
+}
+
+/// Expected file-content size for a content change. Relies on the
+/// `ModifiedEntry` invariant: `has_content` implies `new_metadata.is_some()`.
+fn expected_content_size(change: &Change) -> u64 {
+    match &change.kind {
+        ChangeKind::Added(added) if added.has_content => added.entry.metadata.size,
+        ChangeKind::Modified(modified) if modified.has_content => modified
+            .new_metadata
+            .as_ref()
+            .map(|m| m.size)
+            .expect("has_content implies new_metadata is Some"),
+        _ => 0,
+    }
 }
 
 fn process_write_job(job: WriteJob, root_dir: &Path, result: &mut StreamResult) {
@@ -706,6 +770,58 @@ mod tests {
             let actual = fs::read(target.join(format!("f_{:03}.bin", i))).unwrap();
             assert_eq!(actual, expected, "mismatch in file {}", i);
         }
+    }
+
+    /// Pass 1 (`parse_diff_metadata`) must stop at the first FileContent
+    /// record, so corruption in the content section is invisible to it.
+    /// A full apply, which drains the diff to the end-of-record checksum,
+    /// must still detect the corruption.
+    #[test]
+    fn test_pass1_stops_at_section_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir(&source).unwrap();
+
+        const N: usize = 5;
+        for i in 0..N {
+            fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'a'; 1024]).unwrap();
+        }
+        copy_tree(&source, &target);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        for i in 0..N {
+            fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'b'; 2048]).unwrap();
+        }
+
+        let diff = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff, &snap2, None, false).unwrap();
+
+        // flip a byte deep inside the file — well past the DC section for
+        // 5 tiny DC records, squarely inside the content region.
+        let mut bytes = fs::read(&diff).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        fs::write(&diff, &bytes).unwrap();
+
+        // pass 1 should succeed, it never reads the corrupted content or the
+        // trailing checksum
+        let changes = parse_diff_metadata(&[diff.as_path()]).unwrap();
+        assert!(
+            changes.len() >= N,
+            "pass 1 should return at least {} changes, got {}",
+            N,
+            changes.len()
+        );
+
+        // a full apply reads through EOR and verifies the checksum, so the
+        // corruption must surface as an error.
+        let result = run_apply(&target, &[diff.as_path()]);
+        assert!(result.is_err(), "full apply must reject corrupted diff");
     }
 
     #[test]

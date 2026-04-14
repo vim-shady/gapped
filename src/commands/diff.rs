@@ -7,7 +7,7 @@ use log::info;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // FileContent record header: 8-byte length + 1-byte type tag
 const RECORD_HEADER: u64 = 9;
@@ -111,8 +111,82 @@ fn write_snapshot(
     Ok(())
 }
 
-/// Write split diff files, splitting file content across chunks when a single
-/// file would exceed the split size budget.
+fn write_single_diff(
+    diff_out: &Path,
+    changes: &[Change],
+    source_snapshot_hash: [u8; 32],
+    root_dir: &Path,
+    compress: bool,
+) -> Result<()> {
+    let file = File::create(diff_out)?;
+    let buf_writer = BufWriter::new(file);
+
+    let header = FileHeader::diff(source_snapshot_hash, None);
+    let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
+
+    // Section 1: all DiffChange records.
+    for change in changes {
+        writer.write_diff_change(change)?;
+    }
+
+    // Section 2: FileContent records for each content-bearing change, in the
+    // same order. Pairing is by position across the whole diff.
+    for change in changes.iter().filter(|c| c.has_content()) {
+        write_full_content(&mut writer, change, root_dir)?;
+    }
+
+    writer.finish()?;
+    Ok(())
+}
+
+/// Open the file backing `change` and stream its full content as one
+/// `FileContent` record. Used by `write_single_diff`, where the chunk has
+/// unbounded size and never needs fragmenting.
+fn write_full_content<W: std::io::Write>(
+    writer: &mut FormatWriter<W>,
+    change: &Change,
+    root_dir: &Path,
+) -> Result<()> {
+    let full_path = change.path.to_full_path(root_dir);
+    let file = File::open(&full_path).map_err(|e| GappedError::IoPath {
+        path: full_path.clone(),
+        source: e,
+    })?;
+    let size = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    writer.write_file_content_from_reader(&mut reader, size)?;
+    Ok(())
+}
+
+/// An open file staged for FileContent output. If a chunk fills up mid-file,
+/// the remaining bytes are carried over to the next chunk via the same reader.
+struct PartialFile {
+    reader: BufReader<File>,
+    remaining: u64,
+}
+
+impl PartialFile {
+    fn open(change: &Change, root_dir: &Path) -> Result<Self> {
+        let full_path = change.path.to_full_path(root_dir);
+        let file = File::open(&full_path).map_err(|e| GappedError::IoPath {
+            path: full_path.clone(),
+            source: e,
+        })?;
+        let remaining = file.metadata()?.len();
+        Ok(Self {
+            reader: BufReader::new(file),
+            remaining,
+        })
+    }
+}
+
+/// Write split diff files. Each chunk is a self-contained
+/// `[DiffChange...][FileContent...]` pair. When a FileContent record exceeds
+/// the chunk's remaining budget, it is split across chunks: the current chunk
+/// takes what fits, the next chunk begins with the continuation (and has no
+/// DiffChange records until the straddled file is drained). This preserves
+/// the per-chunk "all metadata, then all content" invariant that lets
+/// `parse_diff_metadata` stop at the first FileContent record.
 fn write_split_diff(
     diff_out: &Path,
     changes: &[Change],
@@ -125,76 +199,79 @@ fn write_split_diff(
         return Ok(());
     }
 
-    /// Create a new chunk writer for split diffs.
-    fn create_chunk_writer(
-        diff_out_str: &str,
-        chunk_number: u32,
-        source_snapshot_hash: [u8; 32],
-        compress: bool,
-    ) -> Result<FormatWriter<BufWriter<File>>> {
-        let path = format!("{}.{:03}", diff_out_str, chunk_number);
-        let file = File::create(&path)?;
-        let buf = BufWriter::new(file);
-        let header = FileHeader::diff(source_snapshot_hash, Some(chunk_number));
-        FormatWriter::maybe_compressed(buf, &header, compress)
-    }
-
-    /// Remaining content budget before the chunk reaches `max_bytes`.
-    fn content_budget<W: std::io::Write>(w: &FormatWriter<W>, max_bytes: u64) -> u64 {
-        max_bytes.saturating_sub(w.bytes_written() + RECORD_HEADER)
-    }
-
     let diff_out_str = diff_out.to_string_lossy();
     let mut chunk_number: u32 = 1;
     let mut writer =
         create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
 
-    let last_idx = changes.len() - 1;
-    for (i, change) in changes.iter().enumerate() {
-        writer.write_diff_change(change)?;
+    // `dc_cursor` points at the next change whose DiffChange still needs to be
+    // written; `fc_cursor` points at the next change whose FileContent still
+    // needs to be written. Invariant: `fc_cursor <= dc_cursor`.
+    let mut dc_cursor = 0usize;
+    let mut fc_cursor = 0usize;
+    let mut partial: Option<PartialFile> = None;
 
-        let needs_content = matches!(&change.kind, ChangeKind::Added(a) if a.has_content)
-            || matches!(&change.kind, ChangeKind::Modified(m) if m.has_content);
-
-        if needs_content {
-            let full_path = change.path.to_full_path(root_dir);
-            let file = File::open(&full_path).map_err(|e| GappedError::IoPath {
-                path: full_path.clone(),
-                source: e,
-            })?;
-            let mut remaining = file.metadata()?.len();
-            let mut reader = BufReader::new(file);
-
-            while remaining > 0 {
-                let mut budget = content_budget(&writer, max_bytes);
-
-                if budget == 0 {
-                    writer.finish()?;
-                    chunk_number += 1;
-                    writer = create_chunk_writer(
-                        &diff_out_str,
-                        chunk_number,
-                        source_snapshot_hash,
-                        compress,
-                    )?;
-                    budget = content_budget(&writer, max_bytes);
-                }
-
-                // if max_bytes < chunk overhead write all
-                // remaining content to guarantee forward progress
-                let fragment = remaining.min(if budget > 0 { budget } else { remaining });
-                writer.write_file_content_from_reader(&mut reader, fragment)?;
-                remaining -= fragment;
+    loop {
+        // drain any spread content from the previous chunk first. While a
+        // file is straddling, no new DiffChanges may be introduced in this
+        // chunk — the position-based pairing would break.
+        if let Some(pf) = partial.as_mut() {
+            write_content_fragment(&mut writer, pf, max_bytes)?;
+            if pf.remaining == 0 {
+                partial = None;
+                fc_cursor += 1;
+            } else {
+                // chunk filled mid-file; roll and continue draining
+                writer.finish()?;
+                chunk_number += 1;
+                writer = create_chunk_writer(
+                    &diff_out_str,
+                    chunk_number,
+                    source_snapshot_hash,
+                    compress,
+                )?;
+                continue;
             }
         }
 
-        // start a fresh chunk for the next change if this one is full.
-        if i < last_idx && writer.bytes_written() >= max_bytes {
-            writer.finish()?;
-            chunk_number += 1;
-            writer =
-                create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
+        // Section 1 (DiffChange): batch as many as will fit in the chunk.
+        while dc_cursor < changes.len() && writer.bytes_written() < max_bytes {
+            writer.write_diff_change(&changes[dc_cursor])?;
+            dc_cursor += 1;
         }
+
+        // Section 2 (FileContent): emit content for committed changes in
+        // `[fc_cursor, dc_cursor)`. Stop when the chunk fills; the straddled
+        // file, if any, is carried over in `partial`.
+        while fc_cursor < dc_cursor {
+            if !changes[fc_cursor].has_content() {
+                fc_cursor += 1;
+                continue;
+            }
+            if writer.bytes_written() + RECORD_HEADER >= max_bytes {
+                break; // no room even for an empty FC record — roll chunk.
+            }
+
+            let mut pf = PartialFile::open(&changes[fc_cursor], root_dir)?;
+            write_content_fragment(&mut writer, &mut pf, max_bytes)?;
+            if pf.remaining == 0 {
+                fc_cursor += 1;
+            } else {
+                partial = Some(pf);
+                break;
+            }
+        }
+
+        let done =
+            dc_cursor >= changes.len() && fc_cursor >= changes.len() && partial.is_none();
+        if done {
+            break;
+        }
+
+        writer.finish()?;
+        chunk_number += 1;
+        writer =
+            create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
     }
 
     writer.finish()?;
@@ -202,66 +279,36 @@ fn write_split_diff(
     Ok(())
 }
 
-fn write_single_diff(
-    diff_out: &Path,
-    changes: &[Change],
+/// Create a new chunk writer for split diffs.
+fn create_chunk_writer(
+    diff_out_str: &str,
+    chunk_number: u32,
     source_snapshot_hash: [u8; 32],
-    root_dir: &Path,
     compress: bool,
-) -> Result<()> {
-    let file = File::create(diff_out)?;
-    let buf_writer = BufWriter::new(file);
-
-    let header = FileHeader::diff(source_snapshot_hash, None);
-
-    let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
-
-    write_changes(&mut writer, changes, root_dir)?;
-
-    writer.finish()?;
-    Ok(())
+) -> Result<FormatWriter<BufWriter<File>>> {
+    let path = format!("{}.{:03}", diff_out_str, chunk_number);
+    let file = File::create(&path)?;
+    let buf = BufWriter::new(file);
+    let header = FileHeader::diff(source_snapshot_hash, Some(chunk_number));
+    FormatWriter::maybe_compressed(buf, &header, compress)
 }
 
-/// Write changes to a format writer, incl. file content
-fn write_changes<W: std::io::Write>(
+/// Write at most one `FileContent` record from `pf` into the current chunk,
+/// respecting `max_bytes`. Updates `pf.remaining`; the caller uses
+/// `pf.remaining == 0` to detect completion.
+///
+/// If `max_bytes` is smaller than the chunk overhead the budget underflows
+/// to 0; in that case the whole remaining fragment is written to guarantee
+/// forward progress.
+fn write_content_fragment<W: std::io::Write>(
     writer: &mut FormatWriter<W>,
-    changes: &[Change],
-    root_dir: &Path,
+    pf: &mut PartialFile,
+    max_bytes: u64,
 ) -> Result<()> {
-    for change in changes {
-        write_one_change(writer, change, root_dir)?;
-    }
-    Ok(())
-}
-
-/// Write a single change record and its file content (if any) to the writer.
-fn write_one_change<W: std::io::Write>(
-    writer: &mut FormatWriter<W>,
-    change: &Change,
-    root_dir: &Path,
-) -> Result<()> {
-    writer.write_diff_change(change)?;
-
-    let needs_content = matches!(&change.kind, ChangeKind::Added(a) if a.has_content)
-        || matches!(&change.kind, ChangeKind::Modified(m) if m.has_content);
-
-    if needs_content {
-        let full_path = change.path.to_full_path(root_dir);
-        match File::open(&full_path) {
-            Ok(file) => {
-                let size = file.metadata()?.len();
-                let mut reader = BufReader::new(file);
-                writer.write_file_content_from_reader(&mut reader, size)?;
-            }
-            Err(e) => {
-                return Err(GappedError::IoPath {
-                    path: full_path,
-                    source: e,
-                });
-            }
-        }
-    }
-
+    let budget = max_bytes.saturating_sub(writer.bytes_written() + RECORD_HEADER);
+    let fragment = pf.remaining.min(if budget > 0 { budget } else { pf.remaining });
+    writer.write_file_content_from_reader(&mut pf.reader, fragment)?;
+    pf.remaining -= fragment;
     Ok(())
 }
 
@@ -323,14 +370,17 @@ fn compute_entry_diff(old: &Entry, new: &Entry) -> Option<Change> {
         return None;
     }
 
+    let has_content = hash_changed && new.kind == EntryKind::File;
     let modified = ModifiedEntry {
-        new_metadata: if metadata_changed {
+        // Always carry new_metadata when content changes — the apply reader
+        // needs size to pair FileContent bytes with this change
+        new_metadata: if metadata_changed || has_content {
             Some(new.metadata.clone())
         } else {
             None
         },
         new_hash: if hash_changed { new.hash } else { None },
-        has_content: hash_changed && new.kind == EntryKind::File,
+        has_content,
         new_symlink_target: if symlink_target_changed {
             new.symlink_target.clone()
         } else {
@@ -361,7 +411,7 @@ fn build_added_change(entry: &Entry) -> Change {
     }
 }
 
-// Unit Tests for compute_diff
+
 #[cfg(test)]
 mod tests {
     use super::*;

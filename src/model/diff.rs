@@ -1,7 +1,7 @@
 use crate::model::entry::{Entry, EntryKind, Metadata};
 use crate::model::path::RelativePath;
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Diff representing all changes between source and target
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -14,7 +14,7 @@ pub struct Diff {
 }
 
 impl Diff {
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 }
 
 /// Single change in the diff
@@ -22,6 +22,16 @@ impl Diff {
 pub struct Change {
     pub path: RelativePath,
     pub kind: ChangeKind,
+}
+
+impl Change {
+    pub fn has_content(&self) -> bool {
+        match &self.kind {
+            ChangeKind::Added(added) => added.has_content,
+            ChangeKind::Modified(modified) => modified.has_content,
+            ChangeKind::Removed(_) => false,
+        }
+    }
 }
 
 /// Kind of change in a single entry
@@ -40,7 +50,11 @@ pub struct AddedEntry {
     pub has_content: bool,
 }
 
-/// Modified entry with only the changed fields
+/// Modified entry with only the changed fields.
+///
+/// Invariant: `has_content == true` implies `new_metadata.is_some()`. The
+/// apply reader relies on `new_metadata.size` to know how many FileContent
+/// bytes belong to this change.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModifiedEntry {
     pub new_metadata: Option<Metadata>,
