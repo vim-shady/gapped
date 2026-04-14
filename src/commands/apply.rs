@@ -4,14 +4,17 @@ use crate::format::reader::FormatReader;
 use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::{EntryKind, Metadata};
 use crate::model::path::RelativePath;
+use crossbeam_channel::{Receiver, Sender};
 use log::{info, warn};
 use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::{File, Permissions};
-use std::io::BufReader;
+use std::io::{BufReader, Write};
+use std::num::NonZeroUsize;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::thread;
 
 struct ApplyResult {
     add_count: usize,
@@ -20,10 +23,24 @@ struct ApplyResult {
     dir_metadata_changes: Vec<(RelativePath, Metadata)>,
 }
 
+#[derive(Default)]
 struct StreamResult {
     add_count: usize,
     mod_count: usize,
     err_count: usize,
+}
+
+impl StreamResult {
+    fn merge(&mut self, other: StreamResult) {
+        self.add_count += other.add_count;
+        self.mod_count += other.mod_count;
+        self.err_count += other.err_count;
+    }
+}
+
+struct WriteJob {
+    change: Change,
+    payload: Vec<u8>,
 }
 
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
@@ -253,61 +270,68 @@ fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyRe
     }
 }
 
-/// A file being assembled from one or more FileContent records.
-struct PendingFile {
-    change: Change,
-    temp: tempfile::NamedTempFile,
-}
-
-/// Persist a fully assembled pending file to its final path and apply metadata.
-fn finalize_pending_file(pf: PendingFile, root_dir: &Path) -> bool {
-    let PendingFile { change, temp } = pf;
-    let full_path = change.path.to_full_path(root_dir);
-    if let Err(e) = temp.persist(&full_path) {
-        warn!("Failed to persist file {}: {}", full_path.display(), e);
-        return false;
-    }
-    match &change.kind {
-        ChangeKind::Added(added) => set_metadata(&full_path, &added.entry.metadata),
-        ChangeKind::Modified(modified) => {
-            if let Some(new_metadata) = &modified.new_metadata {
-                set_metadata(&full_path, new_metadata);
-            }
-        }
-        _ => {}
-    }
-    true
-}
-
-/// If a pending file exists, finalize it and update the result counters.
-fn flush_pending(pending: &mut Option<PendingFile>, root_dir: &Path, result: &mut StreamResult) {
-    if let Some(pf) = pending.take() {
-        let is_add = matches!(&pf.change.kind, ChangeKind::Added(_));
-        if finalize_pending_file(pf, root_dir) {
-            if is_add {
-                result.add_count += 1;
-            } else {
-                result.mod_count += 1;
-            }
-        } else {
-            result.err_count += 1;
-        }
-    }
-}
-
-/// Re-open diff files and stream file content directly to disk.
+/// Re-open diff files and stream file content to disk in parallel.
 ///
-/// Supports content split across multiple chunks: a `FileContent` record
-/// without a preceeding `DiffChange` in the current chunk is treated as a
-/// continuation of the file from the previous chunk.
+/// Reader (this thread) assembles each file's payload into a `Vec<u8>`,
+/// concatenating across multiple `FileContent` records when a large file is
+/// split across chunks, and dispatches one `WriteJob` per file to a pool of
+/// worker threads via a bounded channel. Workers write the tempfile, rename,
+/// and apply metadata in parallel.
+///
+/// Memory bound: up to `N_workers * max_file_size` in-flight payloads.
 fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamResult> {
-    let mut result = StreamResult {
-        add_count: 0,
-        mod_count: 0,
-        err_count: 0,
-    };
-    // persists across chunk boundaries
-    let mut pending: Option<PendingFile> = None;
+    let workers = thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(4)
+        .min(8);
+    let (tx, rx) = crossbeam_channel::bounded::<WriteJob>(workers);
+
+    let handles = spawn_write_workers(workers, rx, root_dir);
+
+    let read_res = read_diff_and_dispatch(diff_files, &tx);
+    drop(tx); // close channel so workers drain and exit
+
+    let mut total = StreamResult::default();
+    for h in handles {
+        match h.join() {
+            Ok(local) => total.merge(local),
+            Err(_) => {
+                return Err(GappedError::ApplyWorkerFailure(
+                    "writer thread panicked",
+                ));
+            }
+        }
+    }
+
+    // surface reader error only after workers have joined, so threads don't get leaked after a reader erirr
+    read_res?;
+    Ok(total)
+}
+
+fn spawn_write_workers(
+    workers: usize,
+    rx: Receiver<WriteJob>,
+    root_dir: &Path,
+) -> Vec<thread::JoinHandle<StreamResult>> {
+    (0..workers)
+        .map(|_| {
+            let rx = rx.clone();
+            let root = root_dir.to_path_buf();
+            thread::spawn(move || {
+                let mut local = StreamResult::default();
+                for job in rx.iter() {
+                    process_write_job(job, &root, &mut local);
+                }
+                local
+            })
+        })
+        .collect()
+}
+
+/// Read all diff chunks, assemble per-file payloads, and dispatch them to workers.
+fn read_diff_and_dispatch(diff_files: &[&Path], tx: &Sender<WriteJob>) -> Result<()> {
+    let mut pending_change: Option<Change> = None;
+    let mut pending_buf: Vec<u8> = Vec::new();
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
@@ -317,36 +341,20 @@ fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamR
         while let Some(header) = format_reader.next_record_header()? {
             match header.record_type {
                 RecordType::DiffChange => {
-                    flush_pending(&mut pending, root_dir, &mut result);
+                    dispatch_pending(&mut pending_change, &mut pending_buf, tx)?;
 
                     let payload = format_reader.read_payload(header.payload_len)?;
                     let change: Change = rmp_serde::from_slice(&payload)?;
-                    let has_content = match &change.kind {
-                        ChangeKind::Added(added) => added.has_content,
-                        ChangeKind::Modified(modified) => modified.has_content,
-                        ChangeKind::Removed(_) => false,
-                    };
-                    if has_content {
-                        let full_path = change.path.to_full_path(root_dir);
-                        let parent = full_path.parent().unwrap_or(Path::new("."));
-                        match tempfile::NamedTempFile::new_in(parent) {
-                            Ok(temp) => {
-                                pending = Some(PendingFile { change, temp });
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to create temp file for {}: {}",
-                                    full_path.display(),
-                                    e
-                                );
-                                result.err_count += 1;
-                            }
-                        }
+                    if change_has_content(&change) {
+                        pending_change = Some(change);
                     }
                 }
                 RecordType::FileContent => {
-                    if let Some(ref mut pf) = pending {
-                        format_reader.copy_payload_to(header.payload_len, &mut pf.temp)?;
+                    if pending_change.is_some() {
+                        // append this fragment to the in-memory buffer. Vec<u8>
+                        // implements Write, so copy_payload_to streams via the
+                        // reader's 64 KiB buffer directly into pending_buf.
+                        format_reader.copy_payload_to(header.payload_len, &mut pending_buf)?;
                     } else {
                         warn!("Unexpected FileContent record without preceding change");
                         format_reader.skip_payload(header.payload_len)?;
@@ -359,8 +367,88 @@ fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamR
         }
     }
 
-    flush_pending(&mut pending, root_dir, &mut result);
-    Ok(result)
+    dispatch_pending(&mut pending_change, &mut pending_buf, tx)?;
+    Ok(())
+}
+
+fn change_has_content(change: &Change) -> bool {
+    match &change.kind {
+        ChangeKind::Added(added) => added.has_content,
+        ChangeKind::Modified(modified) => modified.has_content,
+        ChangeKind::Removed(_) => false,
+    }
+}
+
+/// If a pending change has accumulated content, send it as a `WriteJob` and reset state.
+fn dispatch_pending(
+    pending_change: &mut Option<Change>,
+    pending_buf: &mut Vec<u8>,
+    tx: &Sender<WriteJob>,
+) -> Result<()> {
+    if let Some(change) = pending_change.take() {
+        let payload = std::mem::take(pending_buf);
+        tx.send(WriteJob { change, payload }).map_err(|_| {
+            GappedError::ApplyWorkerFailure("worker pool terminated before reader finished")
+        })?;
+    }
+    Ok(())
+}
+
+fn process_write_job(job: WriteJob, root_dir: &Path, result: &mut StreamResult) {
+    let is_add = matches!(&job.change.kind, ChangeKind::Added(_));
+    if write_streamed_file(&job.change, &job.payload, root_dir) {
+        if is_add {
+            result.add_count += 1;
+        } else {
+            result.mod_count += 1;
+        }
+    } else {
+        result.err_count += 1;
+    }
+}
+
+/// Materialize a single file payload: tempfile in parent, write, persist, set metadata.
+/// Returns false (and logs) on any error; callers count this as `err_count`.
+fn write_streamed_file(change: &Change, payload: &[u8], root_dir: &Path) -> bool {
+    let full_path = change.path.to_full_path(root_dir);
+    let parent = full_path.parent().unwrap_or(Path::new("."));
+
+    let mut temp = match tempfile::NamedTempFile::new_in(parent) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                "Failed to create temp file for {}: {}",
+                full_path.display(),
+                e
+            );
+            return false;
+        }
+    };
+
+    if let Err(e) = temp.as_file_mut().write_all(payload) {
+        warn!(
+            "Failed to write file content for {}: {}",
+            full_path.display(),
+            e
+        );
+        return false;
+    }
+
+    if let Err(e) = temp.persist(&full_path) {
+        warn!("Failed to persist file {}: {}", full_path.display(), e);
+        return false;
+    }
+
+    match &change.kind {
+        ChangeKind::Added(added) => set_metadata(&full_path, &added.entry.metadata),
+        ChangeKind::Modified(modified) => {
+            if let Some(new_metadata) = &modified.new_metadata {
+                set_metadata(&full_path, new_metadata);
+            }
+        }
+        _ => {}
+    }
+    true
 }
 
 /// Set directory mtimes: first for dirs with explicit changes (deepest first),
@@ -576,6 +664,47 @@ mod tests {
         for i in 1..12 {
             let content = fs::read(target.join(format!("file_{:02}.txt", i))).unwrap();
             assert_eq!(content, vec![b'b'; 2048]);
+        }
+    }
+
+    // Exercises the reader + worker-pool pipeline with enough files to saturate
+    // the channel (capacity = workers, max 8). Verifies byte-for-byte parity.
+    #[test]
+    fn test_stream_file_contents_parallel() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir(&source).unwrap();
+
+        const N: usize = 60;
+        for i in 0..N {
+            let fill = (i as u8).wrapping_mul(17);
+            fs::write(source.join(format!("f_{:03}.bin", i)), vec![fill; 4096]).unwrap();
+        }
+
+        copy_tree(&source, &target);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        for i in 0..N {
+            let fill = (i as u8).wrapping_mul(23).wrapping_add(1);
+            fs::write(source.join(format!("f_{:03}.bin", i)), vec![fill; 5000]).unwrap();
+        }
+
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, None, false).unwrap();
+
+        let chunks = detect_diff_files(&diff_base).unwrap();
+        let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
+        run_apply(&target, &chunk_refs).unwrap();
+
+        for i in 0..N {
+            let expected = vec![(i as u8).wrapping_mul(23).wrapping_add(1); 5000];
+            let actual = fs::read(target.join(format!("f_{:03}.bin", i))).unwrap();
+            assert_eq!(actual, expected, "mismatch in file {}", i);
         }
     }
 

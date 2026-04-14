@@ -1,2 +1,6 @@
 /target
 .idea
+/bench-data
+/bench-work
+/bench-results.csv
+/plots
