@@ -111,7 +111,7 @@ mod tests {
             path: RelativePath::new(Path::new(path)).unwrap(),
             kind: EntryKind::File,
             metadata: meta(mtime),
-            hash: Some([hash; 32]),
+            hash: Some([hash; 16]),
             symlink_target: None,
         }
     }
@@ -208,7 +208,7 @@ mod tests {
             path: rel("a.txt"),
             kind: ChangeKind::Modified(ModifiedEntry {
                 new_metadata: Some(meta(500)),
-                new_hash: Some([2; 32]),
+                new_hash: Some([2; 16]),
                 has_content: true,
                 new_symlink_target: None,
             }),
@@ -217,7 +217,7 @@ mod tests {
         let _ = simulate_apply(&mut state, &changes);
         let entry = state.get(&rel("a.txt")).unwrap();
         assert_eq!(entry.metadata.mtime_sec, 500);
-        assert_eq!(entry.hash, Some([2; 32]));
+        assert_eq!(entry.hash, Some([2; 16]));
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub struct Diff {
     pub version: u32,
     pub created_at: i64,
     /// Hash of input snapshot (for integrity check)
-    pub source_snapshot_hash: [u8; 32],
+    pub source_snapshot_hash: [u8; 16],
     pub changes: Vec<Change>,
 }
 
@@ -58,7 +58,7 @@ pub struct AddedEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModifiedEntry {
     pub new_metadata: Option<Metadata>,
-    pub new_hash: Option<[u8; 32]>,
+    pub new_hash: Option<[u8; 16]>,
     pub has_content: bool,
     pub new_symlink_target: Option<PathBuf>,
 }

@@ -1,15 +1,15 @@
-use crate::error::{GappedError, Result};
+use crate::error::Result;
 use crate::format::header::{EOR, FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
 use crate::model::diff::Change;
 use crate::model::entry::Entry;
-use std::io;
 use std::io::Write;
+use xxhash_rust::xxh3::Xxh3;
 
 /// Streaming writer for gapped file format
 /// Writes records one at a time, computing a checksum for everything written
 pub struct FormatWriter<W: Write> {
     inner: WriterInner<W>,
-    hasher: blake3::Hasher,
+    hasher: Xxh3,
     bytes_written: u64,
 }
 
@@ -51,7 +51,7 @@ impl<W: Write> FormatWriter<W> {
     }
 
     fn new_impl(mut inner: W, header: &FileHeader, compress: bool) -> Result<Self> {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Xxh3::new();
 
         // Write magic bytes (uncompressed, so readers can detect format)
         let magic = if compress { MAGIC_COMPRESSED } else { MAGIC };
@@ -103,48 +103,13 @@ impl<W: Write> FormatWriter<W> {
         Ok(())
     }
 
-    /// Write raw file content streaming from a reader.
-    pub fn write_file_content_from_reader<R: io::Read>(
-        &mut self,
-        reader: &mut R,
-        size: u64,
-    ) -> Result<()> {
-        let len_bytes = size.to_le_bytes();
-        let type_byte = [RecordType::FileContent as u8];
-
-        self.inner.write_all(&len_bytes)?;
-        self.hasher.update(&len_bytes);
-        self.inner.write_all(&type_byte)?;
-        self.hasher.update(&type_byte);
-        self.bytes_written += 9;
-
-        let mut buf = [0u8; 64 * 1024];
-        let mut remaining = size;
-        while remaining > 0 {
-            let to_read = (remaining as usize).min(buf.len());
-            let n = reader.read(&mut buf[..to_read])?;
-            if n == 0 {
-                return Err(GappedError::InvalidFormat(format!(
-                    "Unexpected EOF: expected {} more bytes of file content",
-                    remaining
-                )));
-            }
-            self.inner.write_all(&buf[..n])?;
-            self.hasher.update(&buf[..n]);
-            self.bytes_written += n as u64;
-            remaining -= n as u64;
-        }
-
-        Ok(())
-    }
-
     /// Finalize the file by writing EOR marker and checksum
     pub fn finish(mut self) -> Result<W> {
         self.inner.write_all(&EOR)?;
         self.hasher.update(&EOR);
 
-        let hash = self.hasher.finalize();
-        self.inner.write_all(hash.as_bytes())?;
+        let hash = self.hasher.digest128().to_le_bytes();
+        self.inner.write_all(&hash)?;
         self.inner.flush()?;
 
         // Finish compression

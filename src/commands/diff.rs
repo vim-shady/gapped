@@ -3,11 +3,15 @@ use crate::format::header::FileHeader;
 use crate::format::writer::FormatWriter;
 use crate::model::diff::{AddedEntry, Change, ChangeKind, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
+use crossbeam_channel::{Receiver, Sender};
 use log::info;
 use std::cmp::Ordering;
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::BufWriter;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::thread;
 
 // FileContent record header: 8-byte length + 1-byte type tag
 const RECORD_HEADER: u64 = 9;
@@ -114,7 +118,7 @@ fn write_snapshot(
 fn write_single_diff(
     diff_out: &Path,
     changes: &[Change],
-    source_snapshot_hash: [u8; 32],
+    source_snapshot_hash: [u8; 16],
     root_dir: &Path,
     compress: bool,
 ) -> Result<()> {
@@ -129,55 +133,40 @@ fn write_single_diff(
         writer.write_diff_change(change)?;
     }
 
-    // Section 2: FileContent records for each content-bearing change, in the
-    // same order. Pairing is by position across the whole diff.
-    for change in changes.iter().filter(|c| c.has_content()) {
-        write_full_content(&mut writer, change, root_dir)?;
+    // section 2: FileContent records, in change-list order. A pool of reader
+    // threads fetches bytes in parallel, the writer emits records sequentially
+    // so the zstd encoder + rolling hash stay serial.
+    let mut pool = ReaderPool::new(content_paths(changes, root_dir));
+    for idx in 0..pool.len() {
+        let buf = pool.take(idx)?;
+        writer.write_file_content(&buf)?;
     }
+    pool.finish()?;
 
     writer.finish()?;
     Ok(())
 }
 
-/// Open the file backing `change` and stream its full content as one
-/// `FileContent` record. Used by `write_single_diff`, where the chunk has
-/// unbounded size and never needs fragmenting.
-fn write_full_content<W: std::io::Write>(
-    writer: &mut FormatWriter<W>,
-    change: &Change,
-    root_dir: &Path,
-) -> Result<()> {
-    let full_path = change.path.to_full_path(root_dir);
-    let file = File::open(&full_path).map_err(|e| GappedError::IoPath {
-        path: full_path.clone(),
-        source: e,
-    })?;
-    let size = file.metadata()?.len();
-    let mut reader = BufReader::new(file);
-    writer.write_file_content_from_reader(&mut reader, size)?;
-    Ok(())
+/// A content change whose bytes have been prefetched. Tracks the
+/// write offset so that `write-split_diff` can emit the payload across
+/// chunk bounded fragments.
+struct PartialContent {
+    buf: Vec<u8>,
+    offset: usize,
 }
 
-/// An open file staged for FileContent output. If a chunk fills up mid-file,
-/// the remaining bytes are carried over to the next chunk via the same reader.
-struct PartialFile {
-    reader: BufReader<File>,
-    remaining: u64,
-}
-
-impl PartialFile {
-    fn open(change: &Change, root_dir: &Path) -> Result<Self> {
-        let full_path = change.path.to_full_path(root_dir);
-        let file = File::open(&full_path).map_err(|e| GappedError::IoPath {
-            path: full_path.clone(),
-            source: e,
-        })?;
-        let remaining = file.metadata()?.len();
-        Ok(Self {
-            reader: BufReader::new(file),
-            remaining,
-        })
+impl PartialContent {
+    fn remaining(&self) -> u64 {
+        (self.buf.len() - self.offset) as u64
     }
+}
+
+fn content_paths(changes: &[Change], root_dir: &Path) -> Vec<PathBuf> {
+    changes
+        .iter()
+        .filter(|c| c.has_content())
+        .map(|c| c.path.to_full_path(root_dir))
+        .collect()
 }
 
 /// Write split diff files. Each chunk is a self-contained
@@ -190,7 +179,7 @@ impl PartialFile {
 fn write_split_diff(
     diff_out: &Path,
     changes: &[Change],
-    source_snapshot_hash: [u8; 32],
+    source_snapshot_hash: [u8; 16],
     root_dir: &Path,
     max_bytes: u64,
     compress: bool,
@@ -204,20 +193,24 @@ fn write_split_diff(
     let mut writer =
         create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
 
+    let mut pool = ReaderPool::new(content_paths(changes, root_dir));
+
     // `dc_cursor` points at the next change whose DiffChange still needs to be
     // written; `fc_cursor` points at the next change whose FileContent still
     // needs to be written. Invariant: `fc_cursor <= dc_cursor`.
+    // `content_seq` advances once per content-bearing change and keys the pool.
     let mut dc_cursor = 0usize;
     let mut fc_cursor = 0usize;
-    let mut partial: Option<PartialFile> = None;
+    let mut content_seq = 0usize;
+    let mut partial: Option<PartialContent> = None;
 
     loop {
         // drain any spread content from the previous chunk first. While a
         // file is straddling, no new DiffChanges may be introduced in this
         // chunk — the position-based pairing would break.
-        if let Some(pf) = partial.as_mut() {
-            write_content_fragment(&mut writer, pf, max_bytes)?;
-            if pf.remaining == 0 {
+        if let Some(pc) = partial.as_mut() {
+            write_content_fragment(&mut writer, pc, max_bytes)?;
+            if pc.remaining() == 0 {
                 partial = None;
                 fc_cursor += 1;
             } else {
@@ -252,12 +245,14 @@ fn write_split_diff(
                 break; // no room even for an empty FC record — roll chunk.
             }
 
-            let mut pf = PartialFile::open(&changes[fc_cursor], root_dir)?;
-            write_content_fragment(&mut writer, &mut pf, max_bytes)?;
-            if pf.remaining == 0 {
+            let buf = pool.take(content_seq)?;
+            content_seq += 1;
+            let mut pc = PartialContent { buf, offset: 0 };
+            write_content_fragment(&mut writer, &mut pc, max_bytes)?;
+            if pc.remaining() == 0 {
                 fc_cursor += 1;
             } else {
-                partial = Some(pf);
+                partial = Some(pc);
                 break;
             }
         }
@@ -275,6 +270,8 @@ fn write_split_diff(
     }
 
     writer.finish()?;
+    debug_assert_eq!(content_seq, pool.len());
+    pool.finish()?;
     info!("Wrote {} diff chunks", chunk_number);
     Ok(())
 }
@@ -283,7 +280,7 @@ fn write_split_diff(
 fn create_chunk_writer(
     diff_out_str: &str,
     chunk_number: u32,
-    source_snapshot_hash: [u8; 32],
+    source_snapshot_hash: [u8; 16],
     compress: bool,
 ) -> Result<FormatWriter<BufWriter<File>>> {
     let path = format!("{}.{:03}", diff_out_str, chunk_number);
@@ -293,23 +290,163 @@ fn create_chunk_writer(
     FormatWriter::maybe_compressed(buf, &header, compress)
 }
 
-/// Write at most one `FileContent` record from `pf` into the current chunk,
-/// respecting `max_bytes`. Updates `pf.remaining`; the caller uses
-/// `pf.remaining == 0` to detect completion.
+/// Write at most one `FileContent` record from `pc` into the current chunk,
+/// respecting `max_bytes`. Advances `pc.offset`; the caller uses
+/// `pc.remaining() == 0` to detect completion.
 ///
 /// If `max_bytes` is smaller than the chunk overhead the budget underflows
-/// to 0; in that case the whole remaining fragment is written to guarantee
+/// to 0. in that case the whole remaining fragment is written to guarantee
 /// forward progress.
 fn write_content_fragment<W: std::io::Write>(
     writer: &mut FormatWriter<W>,
-    pf: &mut PartialFile,
+    pc: &mut PartialContent,
     max_bytes: u64,
 ) -> Result<()> {
     let budget = max_bytes.saturating_sub(writer.bytes_written() + RECORD_HEADER);
-    let fragment = pf.remaining.min(if budget > 0 { budget } else { pf.remaining });
-    writer.write_file_content_from_reader(&mut pf.reader, fragment)?;
-    pf.remaining -= fragment;
+    let remaining = pc.remaining();
+    let fragment = remaining.min(if budget > 0 { budget } else { remaining });
+    let start = pc.offset;
+    let end = start + fragment as usize;
+    writer.write_file_content(&pc.buf[start..end])?;
+    pc.offset = end;
     Ok(())
+}
+
+/// A job dispatched to a reader worker: assemble the file at `path` into a Vec.
+struct ReadJob {
+    index: usize,
+    path: PathBuf,
+}
+
+/// Result returned from a reader worker.
+struct ReadResult {
+    index: usize,
+    payload: Result<Vec<u8>>,
+}
+
+/// Reads content files in parallel, staying ahead of the
+/// serial writer. The writer calls `take(index)` in strictly increasing
+/// order; the pool blocks until the requested payload arrives. At most
+/// `n_workers` reads are in flight concurrently. Out-of-order results are
+/// buffered in `pending`.
+struct ReaderPool {
+    job_tx: Option<Sender<ReadJob>>,
+    res_rx: Receiver<ReadResult>,
+    handles: Vec<thread::JoinHandle<()>>,
+    paths: Vec<PathBuf>,
+    pending: HashMap<usize, Result<Vec<u8>>>,
+    next_feed: usize,
+    in_flight: usize,
+    n_workers: usize,
+}
+
+impl ReaderPool {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        let n_workers = thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(4)
+            .min(8);
+        let (job_tx, job_rx) = crossbeam_channel::bounded::<ReadJob>(n_workers);
+        let (res_tx, res_rx) = crossbeam_channel::bounded::<ReadResult>(n_workers);
+
+        let handles: Vec<_> = (0..n_workers)
+            .map(|_| {
+                let job_rx = job_rx.clone();
+                let res_tx = res_tx.clone();
+                thread::spawn(move || {
+                    for job in job_rx.iter() {
+                        let payload = read_file_to_vec(&job.path);
+                        if res_tx
+                            .send(ReadResult {
+                                index: job.index,
+                                payload,
+                            })
+                            .is_err()
+                        {
+                            break; // writer gone - exit cleanly
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // close the template handles, only the cloned copies in the workers remain.
+        drop(job_rx);
+        drop(res_tx);
+
+        let mut pool = Self {
+            job_tx: Some(job_tx),
+            res_rx,
+            handles,
+            paths,
+            pending: HashMap::new(),
+            next_feed: 0,
+            in_flight: 0,
+            n_workers,
+        };
+        pool.top_up();
+        pool
+    }
+
+    fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// Keep at most `n_workers` reads in flight.
+    fn top_up(&mut self) {
+        let Some(tx) = self.job_tx.as_ref() else {
+            return;
+        };
+        while self.in_flight < self.n_workers && self.next_feed < self.paths.len() {
+            let idx = self.next_feed;
+            if tx
+                .send(ReadJob {
+                    index: idx,
+                    path: self.paths[idx].clone(),
+                })
+                .is_err()
+            {
+                break;
+            }
+            self.next_feed += 1;
+            self.in_flight += 1;
+        }
+    }
+
+    /// Block until the payload for `index` is available, then return it.
+    /// Propagates any I/O error surfaced by the worker.
+    fn take(&mut self, index: usize) -> Result<Vec<u8>> {
+        while !self.pending.contains_key(&index) {
+            let r = self.res_rx.recv().map_err(|_| {
+                GappedError::WorkerPoolFailure("diff reader pool terminated unexpectedly")
+            })?;
+            self.in_flight -= 1;
+            self.pending.insert(r.index, r.payload);
+            self.top_up();
+        }
+        self.pending
+            .remove(&index)
+            .expect("presence verified in loop above")
+    }
+
+    /// Close the job channel and join all worker threads. Call after the
+    /// writer has drained all payloads it needs.
+    fn finish(mut self) -> Result<()> {
+        self.job_tx.take(); // drop sender → workers drain and exit
+        for handle in self.handles.drain(..) {
+            handle
+                .join()
+                .map_err(|_| GappedError::WorkerPoolFailure("diff reader thread panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+fn read_file_to_vec(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|e| GappedError::IoPath {
+        path: path.to_path_buf(),
+        source: e,
+    })
 }
 
 fn compute_diff(
@@ -430,7 +567,7 @@ mod tests {
         }
     }
 
-    fn make_file(path: &Path, size: u64, mtime_sec: i64, hash: Option<[u8; 32]>) -> Entry {
+    fn make_file(path: &Path, size: u64, mtime_sec: i64, hash: Option<[u8; 16]>) -> Entry {
         Entry {
             path: RelativePath::new(path).unwrap(),
             kind: EntryKind::File,
@@ -460,8 +597,8 @@ mod tests {
         }
     }
 
-    fn dummy_hash(byte: u8) -> [u8; 32] {
-        [byte; 32]
+    fn dummy_hash(byte: u8) -> [u8; 16] {
+        [byte; 16]
     }
 
     fn summarize(changes: &[Change]) -> Vec<(&RelativePath, &str)> {
@@ -1013,6 +1150,55 @@ mod tests {
 
         let total = count_diff_changes(&chunks);
         assert_eq!(total, 8);
+    }
+
+    // saturates the reader pool with a content-heavy diff and round-trips
+    // it through `run_apply` to confirm order preservation: if a worker's
+    // result were matched to the wrong change, the reconstructed files
+    // would show mismatched content.
+    #[test]
+    fn test_parallel_diff_content_read() {
+        use crate::commands::apply::run_apply;
+        use crate::test_util::copy_tree;
+
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src");
+        let target = tmp.path().join("tgt");
+        fs::create_dir(&source).unwrap();
+
+        const N: usize = 60;
+        for i in 0..N {
+            let fill = (i as u8).wrapping_mul(19).wrapping_add(3);
+            fs::write(source.join(format!("f_{:03}.bin", i)), vec![fill; 3000]).unwrap();
+        }
+        copy_tree(&source, &target);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false).unwrap();
+
+        // mdify every file with distinct content to test the parallel
+        // read + in-order write path under split-chunks.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        for i in 0..N {
+            let fill = (i as u8).wrapping_mul(31).wrapping_add(7);
+            fs::write(source.join(format!("f_{:03}.bin", i)), vec![fill; 4096]).unwrap();
+        }
+
+        let diff_base = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(&source, &snap1, &diff_base, &snap2, Some(8192), false).unwrap();
+
+        let chunks = detect_diff_files(&diff_base).unwrap();
+        assert!(chunks.len() > 1, "expected multi-chunk split diff");
+
+        let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
+        run_apply(&target, &chunk_refs).unwrap();
+
+        for i in 0..N {
+            let expected = vec![(i as u8).wrapping_mul(31).wrapping_add(7); 4096];
+            let actual = fs::read(target.join(format!("f_{:03}.bin", i))).unwrap();
+            assert_eq!(actual, expected, "content mismatch for file {}", i);
+        }
     }
 
     #[test]

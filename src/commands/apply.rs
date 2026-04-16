@@ -192,7 +192,7 @@ fn apply_deletions(all_changes: &[Change], root_dir: &Path) -> (usize, usize) {
 }
 
 /// Apply additions and modifications that don't require file content (directories,
-/// symlinks, metadata-only changes). File content writes are handled by `stream_file_contents`.
+/// symlinks, metadata-only changes). File content writes are handled by `stram_file_contents`.
 fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyResult {
     let mut items: Vec<&Change> = all_changes
         .iter()
@@ -308,7 +308,7 @@ fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamR
         match h.join() {
             Ok(local) => total.merge(local),
             Err(_) => {
-                return Err(GappedError::ApplyWorkerFailure("writer thread panicked"));
+                return Err(GappedError::WorkerPoolFailure("writer thread panicked"));
             }
         }
     }
@@ -408,7 +408,7 @@ fn read_diff_and_dispatch(diff_files: &[&Path], tx: &Sender<WriteJob>) -> Result
 }
 
 /// Append one `FileContent`s bytes to the current pending file, starting
-/// a new one from the queue if none is active. Dispatches as soon as the
+/// a new one from the queue if none is active. dispatches as soon as the
 /// acvumulated bytes match the expected size.
 fn read_content_fragment(
     format_reader: &mut FormatReader,
@@ -438,7 +438,7 @@ fn read_content_fragment(
             payload: completed.buffer,
         })
         .map_err(|_| {
-            GappedError::ApplyWorkerFailure("worker pool terminated before reader finished")
+            GappedError::WorkerPoolFailure("worker pool terminated before reader finished")
         })?;
     }
     Ok(())
@@ -560,6 +560,7 @@ fn set_ownership(path: &Path, metadata: &Metadata) {
     }
 }
 
+/// Set mtime on a path (not following symlinks)
 fn set_mtime(path: &Path, mtime_sec: i64, mtime_nsec: u32) {
     use nix::sys::stat::UtimensatFlags;
     use nix::sys::time::TimeSpec;
@@ -801,8 +802,7 @@ mod tests {
         let snap2 = tmp.path().join("snap2");
         run_diff(&source, &snap1, &diff, &snap2, None, false).unwrap();
 
-        // flip a byte deep inside the file — well past the DC section for
-        // 5 tiny DC records, squarely inside the content region.
+        // flip a byte deep inside the file
         let mut bytes = fs::read(&diff).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xff;

@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Magic bytes identifying a gapped file
-pub const MAGIC: &[u8; 9] = b"GAPPED\x00\x02\x00";
+pub const MAGIC: &[u8; 9] = b"GAPPED\x00\x03\x00";
 
 /// Magic bytes for identifying a zstd-compressed gapped file
-pub const MAGIC_COMPRESSED: &[u8; 9] = b"GAPPEDZ02";
+pub const MAGIC_COMPRESSED: &[u8; 9] = b"GAPPEDZ03";
 
 /// End of record marker
 pub const EOR: [u8; 9] = [0u8; 9];
@@ -44,7 +44,7 @@ pub struct FileHeader {
     pub version: u32,
     pub created_at: i64,
     /// For diff files: hash of source snapshot
-    pub source_snapshot_hash: Option<[u8; 32]>,
+    pub source_snapshot_hash: Option<[u8; 16]>,
     /// For snapshots: informational root directory
     pub root_dir: Option<String>,
     /// For split diffs: chunk number (1-based, matches filename suffix)
@@ -70,7 +70,7 @@ impl FileHeader {
         }
     }
 
-    pub fn diff(source_snapshot_hash: [u8; 32], chunk_index: Option<u32>) -> Self {
+    pub fn diff(source_snapshot_hash: [u8; 16], chunk_index: Option<u32>) -> Self {
         Self {
             file_type: "diff".to_string(),
             version: Diff::CURRENT_VERSION,

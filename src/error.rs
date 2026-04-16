@@ -36,8 +36,8 @@ pub enum GappedError {
     #[error("Walk error: {0}")]
     Walk(#[from] walkdir::Error),
 
-    #[error("Apply worker pool failed: {0}")]
-    ApplyWorkerFailure(&'static str),
+    #[error("Worker pool failed: {0}")]
+    WorkerPoolFailure(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, GappedError>;

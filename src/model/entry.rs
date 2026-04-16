@@ -73,7 +73,7 @@ pub struct Entry {
     pub path: RelativePath,
     pub kind: EntryKind,
     pub metadata: Metadata,
-    pub hash: Option<[u8; 32]>,
+    pub hash: Option<[u8; 16]>,
     pub symlink_target: Option<PathBuf>,
 }
 

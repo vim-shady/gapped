@@ -1,6 +1,7 @@
 use crate::error::{GappedError, Result};
 use crate::format::header::{FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
 use std::io::{BufReader, Read, Write};
+use xxhash_rust::xxh3::Xxh3;
 
 /// Header of a record
 pub struct RecordHeader {
@@ -11,13 +12,13 @@ pub struct RecordHeader {
 /// Streaming reader for gapped file format
 pub struct FormatReader {
     inner: Box<dyn Read>,
-    hasher: blake3::Hasher,
+    hasher: Xxh3,
     finished: bool,
 }
 
 impl FormatReader {
     pub fn new<R: Read + 'static>(mut inner: R) -> Result<(Self, FileHeader)> {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Xxh3::new();
 
         // Read magic bytes
         let mut magic = [0u8; 9];
@@ -86,13 +87,13 @@ impl FormatReader {
             self.hasher.update(&type_byte);
 
             // Read and verify checksum
-            let mut checksum_bytes = [0u8; 32];
+            let mut checksum_bytes = [0u8; 16];
             self.inner.read_exact(&mut checksum_bytes)?;
 
-            let expected_hash = self.hasher.finalize();
-            if expected_hash.as_bytes() != &checksum_bytes {
+            let expected_hash = self.hasher.digest128().to_le_bytes();
+            if expected_hash != checksum_bytes {
                 return Err(GappedError::ChecksumMismatch {
-                    expected: Self::hex_encode(expected_hash.as_bytes()),
+                    expected: Self::hex_encode(&expected_hash),
                     got: Self::hex_encode(&checksum_bytes),
                 });
             }
