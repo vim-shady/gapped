@@ -3,13 +3,13 @@ use crate::format::header::FileHeader;
 use crate::format::writer::FormatWriter;
 use crate::model::diff::{AddedEntry, Change, ChangeKind, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
+use crate::parallel::{self, Chunk, ContentReader};
 use crossbeam_channel::{Receiver, Sender};
 use log::info;
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::BufWriter;
-use std::num::NonZeroUsize;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -133,32 +133,19 @@ fn write_single_diff(
         writer.write_diff_change(change)?;
     }
 
-    // section 2: FileContent records, in change-list order. A pool of reader
-    // threads fetches bytes in parallel, the writer emits records sequentially
-    // so the zstd encoder + rolling hash stay serial.
-    let mut pool = ReaderPool::new(content_paths(changes, root_dir));
-    for idx in 0..pool.len() {
-        let buf = pool.take(idx)?;
-        writer.write_file_content(&buf)?;
+    // Section 2: FileContent records, in change-list order. Reader threads
+    // prefetch the next files while the writer streams the current one; the
+    // writer itself stays serial so the zstd encoder + rolling hash see bytes
+    // in order.
+    let mut pool = PrefetchPool::new(content_paths(changes, root_dir));
+    while let Some(mut reader) = pool.next()? {
+        let size = reader.remaining();
+        writer.write_file_content_from_reader(&mut reader, size)?;
     }
     pool.finish()?;
 
     writer.finish()?;
     Ok(())
-}
-
-/// A content change whose bytes have been prefetched. Tracks the
-/// write offset so that `write-split_diff` can emit the payload across
-/// chunk bounded fragments.
-struct PartialContent {
-    buf: Vec<u8>,
-    offset: usize,
-}
-
-impl PartialContent {
-    fn remaining(&self) -> u64 {
-        (self.buf.len() - self.offset) as u64
-    }
 }
 
 fn content_paths(changes: &[Change], root_dir: &Path) -> Vec<PathBuf> {
@@ -170,10 +157,9 @@ fn content_paths(changes: &[Change], root_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Write split diff files. Each chunk is a self-contained
-/// `[DiffChange...][FileContent...]` pair. When a FileContent record exceeds
+/// `[DiffChange...][FileContent...]` pair. When a content record exceeds
 /// the chunk's remaining budget, it is split across chunks: the current chunk
-/// takes what fits, the next chunk begins with the continuation (and has no
-/// DiffChange records until the straddled file is drained). This preserves
+/// takes what fits, the next chunk begins with the continuation. This preserves
 /// the per-chunk "all metadata, then all content" invariant that lets
 /// `parse_diff_metadata` stop at the first FileContent record.
 fn write_split_diff(
@@ -193,28 +179,25 @@ fn write_split_diff(
     let mut writer =
         create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
 
-    let mut pool = ReaderPool::new(content_paths(changes, root_dir));
+    let mut pool = PrefetchPool::new(content_paths(changes, root_dir));
 
-    // `dc_cursor` points at the next change whose DiffChange still needs to be
-    // written; `fc_cursor` points at the next change whose FileContent still
-    // needs to be written. Invariant: `fc_cursor <= dc_cursor`.
-    // `content_seq` advances once per content-bearing change and keys the pool.
+    // dc_cursor points at the next change whose DiffChange still needs to be
+    // written. fc_cursor points at the next change whose content still
+    // needs to be written. Invariant: fc_cursor <= dc_cursor
     let mut dc_cursor = 0usize;
     let mut fc_cursor = 0usize;
-    let mut content_seq = 0usize;
-    let mut partial: Option<PartialContent> = None;
+    let mut partial: Option<ContentReader> = None;
 
     loop {
-        // drain any spread content from the previous chunk first. While a
+        // Drain any content carried from the previous chunk first. While a
         // file is straddling, no new DiffChanges may be introduced in this
         // chunk — the position-based pairing would break.
-        if let Some(pc) = partial.as_mut() {
-            write_content_fragment(&mut writer, pc, max_bytes)?;
-            if pc.remaining() == 0 {
+        if let Some(reader) = partial.as_mut() {
+            write_content_fragment(&mut writer, reader, max_bytes)?;
+            if reader.remaining() == 0 {
                 partial = None;
                 fc_cursor += 1;
             } else {
-                // chunk filled mid-file; roll and continue draining
                 writer.finish()?;
                 chunk_number += 1;
                 writer = create_chunk_writer(
@@ -234,8 +217,8 @@ fn write_split_diff(
         }
 
         // Section 2 (FileContent): emit content for committed changes in
-        // `[fc_cursor, dc_cursor)`. Stop when the chunk fills; the straddled
-        // file, if any, is carried over in `partial`.
+        // [fc_cursor, dc_cursor). Stop when the chunk fills; the straddled
+        // file, if any, is carried over in 'partial'.
         while fc_cursor < dc_cursor {
             if !changes[fc_cursor].has_content() {
                 fc_cursor += 1;
@@ -245,32 +228,29 @@ fn write_split_diff(
                 break; // no room even for an empty FC record — roll chunk.
             }
 
-            let buf = pool.take(content_seq)?;
-            content_seq += 1;
-            let mut pc = PartialContent { buf, offset: 0 };
-            write_content_fragment(&mut writer, &mut pc, max_bytes)?;
-            if pc.remaining() == 0 {
+            let mut reader = pool
+                .next()?
+                .expect("pool drained before fc_cursor caught up");
+            write_content_fragment(&mut writer, &mut reader, max_bytes)?;
+            if reader.remaining() == 0 {
                 fc_cursor += 1;
             } else {
-                partial = Some(pc);
+                partial = Some(reader);
                 break;
             }
         }
 
-        let done =
-            dc_cursor >= changes.len() && fc_cursor >= changes.len() && partial.is_none();
+        let done = dc_cursor >= changes.len() && fc_cursor >= changes.len() && partial.is_none();
         if done {
             break;
         }
 
         writer.finish()?;
         chunk_number += 1;
-        writer =
-            create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
+        writer = create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
     }
 
     writer.finish()?;
-    debug_assert_eq!(content_seq, pool.len());
     pool.finish()?;
     info!("Wrote {} diff chunks", chunk_number);
     Ok(())
@@ -290,163 +270,189 @@ fn create_chunk_writer(
     FormatWriter::maybe_compressed(buf, &header, compress)
 }
 
-/// Write at most one `FileContent` record from `pc` into the current chunk,
-/// respecting `max_bytes`. Advances `pc.offset`; the caller uses
-/// `pc.remaining() == 0` to detect completion.
+/// Stream up to one chunk's bytes from `reader` into a FileContent
+/// record. Advances the reader, caller uses `reader.remaining() == 0` to
+/// detect completion.
 ///
-/// If `max_bytes` is smaller than the chunk overhead the budget underflows
-/// to 0. in that case the whole remaining fragment is written to guarantee
+/// If `max_bytes` is smaller than the record overhead, the budget underflows
+/// to 0 — in that case the whole remaining payload is written to guarantee
 /// forward progress.
-fn write_content_fragment<W: std::io::Write>(
+fn write_content_fragment<W: Write>(
     writer: &mut FormatWriter<W>,
-    pc: &mut PartialContent,
+    reader: &mut ContentReader,
     max_bytes: u64,
 ) -> Result<()> {
     let budget = max_bytes.saturating_sub(writer.bytes_written() + RECORD_HEADER);
-    let remaining = pc.remaining();
+    let remaining = reader.remaining();
     let fragment = remaining.min(if budget > 0 { budget } else { remaining });
-    let start = pc.offset;
-    let end = start + fragment as usize;
-    writer.write_file_content(&pc.buf[start..end])?;
-    pc.offset = end;
+    writer.write_file_content_from_reader(reader, fragment)?;
     Ok(())
 }
 
-/// A job dispatched to a reader worker: assemble the file at `path` into a Vec.
+/// A job dispatched to a prefetch worker.
 struct ReadJob {
-    index: usize,
     path: PathBuf,
+    size_tx: Sender<io::Result<u64>>,
+    chunk_tx: Sender<Chunk>,
 }
 
-/// Result returned from a reader worker.
-struct ReadResult {
-    index: usize,
-    payload: Result<Vec<u8>>,
+/// One file queued for prefetching. `size_rx` resolves to the file
+/// size (or an open error). `chunk_rx` streams the payload afterward.
+struct Pending {
+    path: PathBuf,
+    size_rx: Receiver<io::Result<u64>>,
+    chunk_rx: Receiver<Chunk>,
 }
 
-/// Reads content files in parallel, staying ahead of the
-/// serial writer. The writer calls `take(index)` in strictly increasing
-/// order; the pool blocks until the requested payload arrives. At most
-/// `n_workers` reads are in flight concurrently. Out-of-order results are
-/// buffered in `pending`.
-struct ReaderPool {
-    job_tx: Option<Sender<ReadJob>>,
-    res_rx: Receiver<ReadResult>,
-    handles: Vec<thread::JoinHandle<()>>,
+/// Prefetches file content in parallel, handing out `ContentReader`s in
+/// change-list order. At most `n_workers` files are streamed concurrently,
+/// each bounded to `CHUNK_DEPTH` buffered chunks
+struct PrefetchPool {
     paths: Vec<PathBuf>,
-    pending: HashMap<usize, Result<Vec<u8>>>,
-    next_feed: usize,
-    in_flight: usize,
-    n_workers: usize,
+    in_flight: VecDeque<Pending>,
+    next_spawn: usize,
+    max_in_flight: usize,
+    job_tx: Option<Sender<ReadJob>>,
+    handles: Vec<thread::JoinHandle<()>>,
 }
 
-impl ReaderPool {
+impl PrefetchPool {
     fn new(paths: Vec<PathBuf>) -> Self {
-        let n_workers = thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(4)
-            .min(8);
+        let n_workers = parallel::worker_count();
         let (job_tx, job_rx) = crossbeam_channel::bounded::<ReadJob>(n_workers);
-        let (res_tx, res_rx) = crossbeam_channel::bounded::<ReadResult>(n_workers);
 
         let handles: Vec<_> = (0..n_workers)
             .map(|_| {
                 let job_rx = job_rx.clone();
-                let res_tx = res_tx.clone();
                 thread::spawn(move || {
                     for job in job_rx.iter() {
-                        let payload = read_file_to_vec(&job.path);
-                        if res_tx
-                            .send(ReadResult {
-                                index: job.index,
-                                payload,
-                            })
-                            .is_err()
-                        {
-                            break; // writer gone - exit cleanly
-                        }
+                        stream_file(job);
                     }
                 })
             })
             .collect();
-
-        // close the template handles, only the cloned copies in the workers remain.
         drop(job_rx);
-        drop(res_tx);
 
         let mut pool = Self {
-            job_tx: Some(job_tx),
-            res_rx,
-            handles,
             paths,
-            pending: HashMap::new(),
-            next_feed: 0,
-            in_flight: 0,
-            n_workers,
+            in_flight: VecDeque::new(),
+            next_spawn: 0,
+            max_in_flight: n_workers,
+            job_tx: Some(job_tx),
+            handles,
         };
         pool.top_up();
         pool
     }
 
-    fn len(&self) -> usize {
-        self.paths.len()
-    }
-
-    /// Keep at most `n_workers` reads in flight.
+    /// Dispatch jobs up to the concurrency cap.
     fn top_up(&mut self) {
         let Some(tx) = self.job_tx.as_ref() else {
             return;
         };
-        while self.in_flight < self.n_workers && self.next_feed < self.paths.len() {
-            let idx = self.next_feed;
+        while self.in_flight.len() < self.max_in_flight && self.next_spawn < self.paths.len() {
+            let path = self.paths[self.next_spawn].clone();
+            self.next_spawn += 1;
+            let (size_tx, size_rx) = crossbeam_channel::bounded(1);
+            let (chunk_tx, chunk_rx) = parallel::chunk_channel();
             if tx
                 .send(ReadJob {
-                    index: idx,
-                    path: self.paths[idx].clone(),
+                    path: path.clone(),
+                    size_tx,
+                    chunk_tx,
                 })
                 .is_err()
             {
                 break;
             }
-            self.next_feed += 1;
-            self.in_flight += 1;
+            self.in_flight.push_back(Pending {
+                path,
+                size_rx,
+                chunk_rx,
+            });
         }
     }
 
-    /// Block until the payload for `index` is available, then return it.
-    /// Propagates any I/O error surfaced by the worker.
-    fn take(&mut self, index: usize) -> Result<Vec<u8>> {
-        while !self.pending.contains_key(&index) {
-            let r = self.res_rx.recv().map_err(|_| {
-                GappedError::WorkerPoolFailure("diff reader pool terminated unexpectedly")
-            })?;
-            self.in_flight -= 1;
-            self.pending.insert(r.index, r.payload);
-            self.top_up();
-        }
-        self.pending
-            .remove(&index)
-            .expect("presence verified in loop above")
+    /// Pop the next file in queue order, blocking until its size is known.
+    /// Returns `Ok(None)` once every queued path has been handed out.
+    fn next(&mut self) -> Result<Option<ContentReader>> {
+        let Some(pending) = self.in_flight.pop_front() else {
+            return Ok(None);
+        };
+        self.top_up();
+        let size = pending.size_rx.recv().map_err(|_| {
+            GappedError::WorkerPoolFailure("prefetch worker exited before reporting size")
+        })?;
+        let size = size.map_err(|source| GappedError::IoPath {
+            path: pending.path,
+            source,
+        })?;
+        Ok(Some(ContentReader::new(pending.chunk_rx, size)))
     }
 
-    /// Close the job channel and join all worker threads. Call after the
-    /// writer has drained all payloads it needs.
+    /// Close job channel and join all worker threads.
     fn finish(mut self) -> Result<()> {
-        self.job_tx.take(); // drop sender → workers drain and exit
+        self.job_tx.take();
         for handle in self.handles.drain(..) {
-            handle
-                .join()
-                .map_err(|_| GappedError::WorkerPoolFailure("diff reader thread panicked"))?;
+            parallel::join_worker(handle, "diff reader thread panicked")?;
         }
         Ok(())
     }
 }
 
-fn read_file_to_vec(path: &Path) -> Result<Vec<u8>> {
-    fs::read(path).map_err(|e| GappedError::IoPath {
-        path: path.to_path_buf(),
-        source: e,
-    })
+/// Open the file, report its size, then stream the payload as `CHUNK_SIZE`
+/// chunks through `chunk_tx`. Stops after exactly `size` bytes.
+fn stream_file(job: ReadJob) {
+    let ReadJob {
+        path,
+        size_tx,
+        chunk_tx,
+    } = job;
+
+    let opened = File::open(&path).and_then(|f| {
+        let size = f.metadata()?.len();
+        Ok((f, size))
+    });
+
+    let (file, size) = match opened {
+        Ok(v) => {
+            if size_tx.send(Ok(v.1)).is_err() {
+                return;
+            }
+            v
+        }
+        Err(e) => {
+            let _ = size_tx.send(Err(e));
+            return;
+        }
+    };
+
+    let mut reader = BufReader::with_capacity(parallel::CHUNK_SIZE, file);
+    let mut remaining = size;
+    while remaining > 0 {
+        let want = parallel::CHUNK_SIZE.min(remaining as usize);
+        let mut buf = vec![0u8; want];
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                let _ = chunk_tx.send(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "file truncated while streaming",
+                )));
+                return;
+            }
+            Ok(n) => {
+                buf.truncate(n);
+                if chunk_tx.send(Ok(buf)).is_err() {
+                    return;
+                }
+                remaining -= n as u64;
+            }
+            Err(e) => {
+                let _ = chunk_tx.send(Err(e));
+                return;
+            }
+        }
+    }
 }
 
 fn compute_diff(
@@ -547,7 +553,6 @@ fn build_added_change(entry: &Entry) -> Change {
         }),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

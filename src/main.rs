@@ -4,6 +4,7 @@ mod error;
 mod format;
 mod fs;
 mod model;
+mod parallel;
 #[cfg(test)]
 mod test_util;
 
@@ -14,6 +15,20 @@ use crate::commands::diff::run_diff;
 use crate::commands::snapshot::run_snapshot;
 use crate::commands::verify::run_verify;
 use cli::{Cli, Commands};
+
+fn resolve_diff_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    match detect_diff_files(path) {
+        Ok(files) if files.is_empty() => {
+            eprintln!("Error: No diff file(s) found at {}", path.display());
+            std::process::exit(1);
+        }
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+    }
+}
 
 fn main() {
     env_logger::init();
@@ -44,14 +59,7 @@ fn main() {
             compress,
         ),
         Commands::Apply { root_dir, diff_in } => {
-            let diff_files = match detect_diff_files(&diff_in) {
-                Ok(files) if files.is_empty() => {
-                    eprintln!("Error: No diff file(s) found at {}", diff_in.display());
-                    std::process::exit(1);
-                }
-                Ok(files) => files,
-                Err(e) => { eprintln!("Error: {:#}", e); std::process::exit(1); }
-            };
+            let diff_files = resolve_diff_files(&diff_in);
             let diff_refs: Vec<&std::path::Path> = diff_files.iter().map(|p| p.as_path()).collect();
             run_apply(&root_dir, &diff_refs)
         }
@@ -60,14 +68,7 @@ fn main() {
             diff_file,
             snapshot_file,
         } => {
-            let diff_files = match detect_diff_files(&diff_file) {
-                Ok(files) if files.is_empty() => {
-                    eprintln!("Error: No diff file(s) found at {}", diff_file.display());
-                    std::process::exit(1);
-                }
-                Ok(files) => files,
-                Err(e) => { eprintln!("Error: {:#}", e); std::process::exit(1); }
-            };
+            let diff_files = resolve_diff_files(&diff_file);
             let diff_refs: Vec<&std::path::Path> = diff_files.iter().map(|p| p.as_path()).collect();
             run_verify(&root_dir, &diff_refs, &snapshot_file)
         }

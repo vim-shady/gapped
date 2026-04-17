@@ -1,8 +1,8 @@
-use crate::error::Result;
+use crate::error::{GappedError, Result};
 use crate::format::header::{EOR, FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
 use crate::model::diff::Change;
 use crate::model::entry::Entry;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use xxhash_rust::xxh3::Xxh3;
 
 /// Streaming writer for gapped file format
@@ -35,15 +35,6 @@ impl<W: Write> WriterInner<W> {
 }
 
 impl<W: Write> FormatWriter<W> {
-    /// Create a new FormatWriter and write magic bytes + header
-    pub fn new(inner: W, header: &FileHeader) -> Result<Self> {
-        Self::new_impl(inner, header, false)
-    }
-
-    /// Create a new compressed FormatWriter
-    pub fn new_compressed(inner: W, header: &FileHeader) -> Result<Self> {
-        Self::new_impl(inner, header, true)
-    }
 
     /// Create a FormatWriter, optionally compressed
     pub fn maybe_compressed(inner: W, header: &FileHeader, compress: bool) -> Result<Self> {
@@ -97,9 +88,39 @@ impl<W: Write> FormatWriter<W> {
         Ok(())
     }
 
-    /// Write raw file content.
-    pub fn write_file_content(&mut self, content: &[u8]) -> Result<()> {
-        self.write_record(RecordType::FileContent, content)?;
+    /// Stream a `FileContent` record of exactly `size` bytes from `reader`.
+    /// Lets the caller hand bytes to the encoder + rolling hash without ever
+    /// materializing the whole payload in memory.
+    pub fn write_file_content_from_reader<R: Read>(
+        &mut self,
+        reader: &mut R,
+        size: u64,
+    ) -> Result<()> {
+        let len_bytes = size.to_le_bytes();
+        let type_byte = [RecordType::FileContent as u8];
+
+        self.inner.write_all(&len_bytes)?;
+        self.hasher.update(&len_bytes);
+        self.inner.write_all(&type_byte)?;
+        self.hasher.update(&type_byte);
+        self.bytes_written += 9;
+
+        let mut buf = [0u8; 64 * 1024];
+        let mut remaining = size;
+        while remaining > 0 {
+            let want = (remaining as usize).min(buf.len());
+            let n = reader.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(GappedError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("FileContent short by {} bytes", remaining),
+                )));
+            }
+            self.inner.write_all(&buf[..n])?;
+            self.hasher.update(&buf[..n]);
+            self.bytes_written += n as u64;
+            remaining -= n as u64;
+        }
         Ok(())
     }
 

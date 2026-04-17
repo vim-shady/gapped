@@ -4,14 +4,14 @@ use crate::format::reader::FormatReader;
 use crate::model::diff::{Change, ChangeKind, Diff};
 use crate::model::entry::{EntryKind, Metadata};
 use crate::model::path::RelativePath;
+use crate::parallel::{self, ContentReader, ContentSink};
 use crossbeam_channel::{Receiver, Sender};
 use log::{info, warn};
 use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::{File, Permissions};
-use std::io::{BufReader, Write};
-use std::num::NonZeroUsize;
+use std::io::{self, BufReader};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -38,9 +38,9 @@ impl StreamResult {
     }
 }
 
-struct WriteJob {
+struct StreamedFile {
     change: Change,
-    payload: Vec<u8>,
+    reader: ContentReader,
 }
 
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
@@ -286,42 +286,35 @@ fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyRe
 
 /// Re-open diff files and stream file content to disk in parallel.
 ///
-/// Reader assembles each file's payload into a `Vec<u8>`,
-/// concatenating across multiple `FileContent` records when a lrge file is
-/// split across chunks, and dispatches one `WriteJob` per file to a pool of
-/// worker  threads via a bounded channel. Workers write the tempfile, rename,
-/// and apply metadata in parallel.
+/// The dispatcher reads diff records sequentially and, for each content
+/// change, creates a bounded chunk channel. It dispatches a `StreamedFile`
+/// (carrying the reader end) to a worker pool, then streams `FileContent`
+/// record payloads into the writer end via `ContentSink`. Workers write to
+/// a tempfile via `io::copy`, rename, and apply metadata in parallel.
 fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamResult> {
-    let workers = thread::available_parallelism()
-        .map(NonZeroUsize::get)
-        .unwrap_or(4)
-        .min(8);
-    let (tx, rx) = crossbeam_channel::bounded::<WriteJob>(workers);
+    let workers = parallel::worker_count();
+    let (tx, rx) = crossbeam_channel::bounded::<StreamedFile>(workers);
 
     let handles = spawn_write_workers(workers, rx, root_dir);
 
     let read_res = read_diff_and_dispatch(diff_files, &tx);
-    drop(tx); // close channel so workers drain and exit
+    drop(tx);
 
     let mut total = StreamResult::default();
     for h in handles {
-        match h.join() {
-            Ok(local) => total.merge(local),
-            Err(_) => {
-                return Err(GappedError::WorkerPoolFailure("writer thread panicked"));
-            }
-        }
+        let local = parallel::join_worker(h, "writer thread panicked")?;
+        total.merge(local);
     }
 
-    // surface reader error only after workers have joined, so threads don't get leaked after
-    // a reader erirr
+    // Surface reader error only after workers have joined so threads are
+    // not leaked on an early return.
     read_res?;
     Ok(total)
 }
 
 fn spawn_write_workers(
     workers: usize,
-    rx: Receiver<WriteJob>,
+    rx: Receiver<StreamedFile>,
     root_dir: &Path,
 ) -> Vec<thread::JoinHandle<StreamResult>> {
     (0..workers)
@@ -331,117 +324,12 @@ fn spawn_write_workers(
             thread::spawn(move || {
                 let mut local = StreamResult::default();
                 for job in rx.iter() {
-                    process_write_job(job, &root, &mut local);
+                    process_streamed_file(job, &root, &mut local);
                 }
                 local
             })
         })
         .collect()
-}
-
-/// A content change whose `DiffChange` has been read but whose
-/// `FileContent` bytes are still being accumulated across one or more records.
-struct PendingContent {
-    change: Change,
-    buffer: Vec<u8>,
-    expected_size: u64,
-}
-
-impl PendingContent {
-    fn new(change: Change) -> Self {
-        let expected_size = expected_content_size(&change);
-        Self {
-            change,
-            buffer: Vec::with_capacity(expected_size as usize),
-            expected_size,
-        }
-    }
-}
-
-/// Read all diff chunks, assemble per-file payloads, and dispatch them to workers.
-///
-/// Wach chunk stores all `DiffChange` records first, then
-/// all `FileContent` records. Pairing is by position across the whole diff
-/// (not per chunk), such that content changes are queued as their DCs are
-/// read, then drained by incoming FC records. A single file may span multiple
-/// FC records — completion is detected by matching `buffer.len()` against the
-/// expected size drawn from the change metadata.
-fn read_diff_and_dispatch(diff_files: &[&Path], tx: &Sender<WriteJob>) -> Result<()> {
-    let mut queue: VecDeque<PendingContent> = VecDeque::new();
-    let mut current: Option<PendingContent> = None;
-
-    for diff_path in diff_files {
-        let file = File::open(diff_path)?;
-        let reader = BufReader::new(file);
-        let (mut format_reader, header) = FormatReader::new(reader)?;
-        check_diff_version(&header)?;
-
-        while let Some(record) = format_reader.next_record_header()? {
-            match record.record_type {
-                RecordType::DiffChange => {
-                    let payload = format_reader.read_payload(record.payload_len)?;
-                    let change: Change = rmp_serde::from_slice(&payload)?;
-                    if change.has_content() {
-                        queue.push_back(PendingContent::new(change));
-                    }
-                }
-                RecordType::FileContent => {
-                    read_content_fragment(
-                        &mut format_reader,
-                        record.payload_len,
-                        &mut current,
-                        &mut queue,
-                        tx,
-                    )?;
-                }
-                _ => format_reader.skip_payload(record.payload_len)?,
-            }
-        }
-    }
-
-    if current.is_some() || !queue.is_empty() {
-        return Err(GappedError::InvalidFormat(
-            "diff ended with unresolved content records".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Append one `FileContent`s bytes to the current pending file, starting
-/// a new one from the queue if none is active. dispatches as soon as the
-/// acvumulated bytes match the expected size.
-fn read_content_fragment(
-    format_reader: &mut FormatReader,
-    payload_len: u64,
-    current: &mut Option<PendingContent>,
-    queue: &mut VecDeque<PendingContent>,
-    tx: &Sender<WriteJob>,
-) -> Result<()> {
-    if current.is_none() {
-        match queue.pop_front() {
-            Some(pc) => *current = Some(pc),
-            None => {
-                warn!("FileContent record with no pending change; skipping");
-                format_reader.skip_payload(payload_len)?;
-                return Ok(());
-            }
-        }
-    }
-
-    let pc = current.as_mut().expect("set above");
-    format_reader.copy_payload_to(payload_len, &mut pc.buffer)?;
-
-    if pc.buffer.len() as u64 >= pc.expected_size {
-        let completed = current.take().expect("present above");
-        tx.send(WriteJob {
-            change: completed.change,
-            payload: completed.buffer,
-        })
-        .map_err(|_| {
-            GappedError::WorkerPoolFailure("worker pool terminated before reader finished")
-        })?;
-    }
-    Ok(())
 }
 
 /// Expected file-content size for a content change. Relies on the
@@ -458,9 +346,79 @@ fn expected_content_size(change: &Change) -> u64 {
     }
 }
 
-fn process_write_job(job: WriteJob, root_dir: &Path, result: &mut StreamResult) {
+/// Read all diff chunks and stream file payloads to workers.
+///
+/// Each chunk stores all `DiffChange` records first, then all `FileContent`
+/// records. Pairing is by position across the whole diff.
+/// A single file may span multiple `FileContent` records when the diff is
+/// split; completion is detected by tracking `remaining` bytes against the
+/// expected size from the change metadata.
+fn read_diff_and_dispatch(diff_files: &[&Path], tx: &Sender<StreamedFile>) -> Result<()> {
+    let mut queue: VecDeque<(Change, u64)> = VecDeque::new();
+    let mut active: Option<(ContentSink, u64)> = None;
+
+    for diff_path in diff_files {
+        let file = File::open(diff_path)?;
+        let reader = BufReader::new(file);
+        let (mut format_reader, header) = FormatReader::new(reader)?;
+        check_diff_version(&header)?;
+
+        while let Some(record) = format_reader.next_record_header()? {
+            match record.record_type {
+                RecordType::DiffChange => {
+                    let payload = format_reader.read_payload(record.payload_len)?;
+                    let change: Change = rmp_serde::from_slice(&payload)?;
+                    if change.has_content() {
+                        let size = expected_content_size(&change);
+                        queue.push_back((change, size));
+                    }
+                }
+                RecordType::FileContent => {
+                    if active.is_none() {
+                        let (change, size) =
+                            queue.pop_front().ok_or_else(|| {
+                                GappedError::InvalidFormat(
+                                    "FileContent record with no pending change".into(),
+                                )
+                            })?;
+                        let (chunk_tx, chunk_rx) = parallel::chunk_channel();
+                        let content_reader = ContentReader::new(chunk_rx, size);
+                        tx.send(StreamedFile {
+                            change,
+                            reader: content_reader,
+                        })
+                        .map_err(|_| {
+                            GappedError::WorkerPoolFailure(
+                                "worker pool closed during dispatch",
+                            )
+                        })?;
+                        active = Some((ContentSink::new(chunk_tx), size));
+                    }
+
+                    let (sink, remaining) = active.as_mut().unwrap();
+                    format_reader.copy_payload_to(record.payload_len, sink)?;
+                    *remaining = remaining.saturating_sub(record.payload_len);
+
+                    if *remaining == 0 {
+                        active = None;
+                    }
+                }
+                _ => format_reader.skip_payload(record.payload_len)?,
+            }
+        }
+    }
+
+    if active.is_some() || !queue.is_empty() {
+        return Err(GappedError::InvalidFormat(
+            "diff ended with unresolved content records".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn process_streamed_file(job: StreamedFile, root_dir: &Path, result: &mut StreamResult) {
     let is_add = matches!(&job.change.kind, ChangeKind::Added(_));
-    if write_streamed_file(&job.change, &job.payload, root_dir) {
+    if write_streamed_file(&job.change, job.reader, root_dir) {
         if is_add {
             result.add_count += 1;
         } else {
@@ -471,9 +429,8 @@ fn process_write_job(job: WriteJob, root_dir: &Path, result: &mut StreamResult) 
     }
 }
 
-/// Materialize a single file payload: tempfile in parent, write, persist, set metadata.
-/// Returns false (and logs) on any error; callers count this as `err_count`.
-fn write_streamed_file(change: &Change, payload: &[u8], root_dir: &Path) -> bool {
+/// Stream a file from its `ContentReader` to a tempfile, persist, set metadata.
+fn write_streamed_file(change: &Change, mut reader: ContentReader, root_dir: &Path) -> bool {
     let full_path = change.path.to_full_path(root_dir);
     let parent = full_path.parent().unwrap_or(Path::new("."));
 
@@ -489,7 +446,7 @@ fn write_streamed_file(change: &Change, payload: &[u8], root_dir: &Path) -> bool
         }
     };
 
-    if let Err(e) = temp.as_file_mut().write_all(payload) {
+    if let Err(e) = io::copy(&mut reader, temp.as_file_mut()) {
         warn!(
             "Failed to write file content for {}: {}",
             full_path.display(),
