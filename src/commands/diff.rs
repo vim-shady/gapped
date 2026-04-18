@@ -4,6 +4,7 @@ use crate::format::writer::FormatWriter;
 use crate::model::diff::{AddedEntry, Change, ChangeKind, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
 use crate::parallel::{self, Chunk, ContentReader};
+use crate::progress::Reporter;
 use crossbeam_channel::{Receiver, Sender};
 use log::info;
 use std::cmp::Ordering;
@@ -23,25 +24,31 @@ pub fn run_diff(
     snapshot_out: &Path,
     split_size: Option<u64>,
     compress: bool,
+    reporter: &Reporter,
 ) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
 
     // Compute hash of input snapshot
     info!("Hashing input snapshot {}", snapshot_in.display());
+    let hash_pb = reporter.spinner("Hashing input snapshot");
     let source_snapshot_hash =
         crate::fs::hash::hash_file(snapshot_in).map_err(|e| GappedError::IoPath {
             path: snapshot_in.to_path_buf(),
             source: e,
         })?;
+    hash_pb.finish_and_clear();
 
     // Load the input snapshot (sorted by path) so walk can binary-search it
     // for hash reuse.
     info!("Loading input snapshot {}", snapshot_in.display());
+    let load_pb = reporter.spinner("Loading input snapshot");
     let (old_entries, _old_header) = crate::commands::snapshot::load_snapshot(snapshot_in)?;
+    load_pb.finish_with_message(format!("Loaded {} entries from input snapshot", old_entries.len()));
 
     // Walk current filesystem
     info!("Walking filesystem under {}", root_dir.display());
-    let (new_entries, stats) = crate::fs::walk::walk_filesystem(&root_dir, Some(&old_entries))?;
+    let (new_entries, stats) =
+        crate::fs::walk::walk_filesystem(&root_dir, Some(&old_entries), reporter)?;
 
     // Compute diff
     info!("Computing diff");
@@ -1020,14 +1027,14 @@ mod tests {
         seed_source(&source, 3, b"hello");
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(source.join("f_000.dat"), b"updated").unwrap();
 
         let diff = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff, &snap2, None, false).unwrap();
+        run_diff(&source, &snap1, &diff, &snap2, None, false, &Reporter::hidden()).unwrap();
 
         assert!(diff.exists(), "single diff file should be written");
         assert!(
@@ -1043,7 +1050,7 @@ mod tests {
         seed_source(&source, 10, &vec![b'a'; 1024]);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         // modify every file so the diff contains changes for every file
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -1053,7 +1060,16 @@ mod tests {
 
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, Some(4096), false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            Some(4096),
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         // base path itself should NOT exist...
         assert!(!diff_base.exists());
@@ -1078,7 +1094,7 @@ mod tests {
         seed_source(&source, 15, &vec![b'a'; 512]);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         // 15 modifications + 1 addition + 1 removal = 17 changes
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -1090,7 +1106,16 @@ mod tests {
 
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            Some(2048),
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1);
@@ -1109,7 +1134,7 @@ mod tests {
         seed_source(&source, 6, &vec![b'a'; 1024]);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..6 {
@@ -1118,7 +1143,16 @@ mod tests {
 
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, Some(3072), false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            Some(3072),
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1);
@@ -1139,7 +1173,7 @@ mod tests {
         seed_source(&source, 8, &vec![b'a'; 1024]);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..8 {
@@ -1148,7 +1182,16 @@ mod tests {
 
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), true).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            Some(2048),
+            true,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1);
@@ -1179,7 +1222,7 @@ mod tests {
         copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         // mdify every file with distinct content to test the parallel
         // read + in-order write path under split-chunks.
@@ -1191,13 +1234,22 @@ mod tests {
 
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, Some(8192), false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            Some(8192),
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1, "expected multi-chunk split diff");
 
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
-        run_apply(&target, &chunk_refs).unwrap();
+        run_apply(&target, &chunk_refs, &Reporter::hidden()).unwrap();
 
         for i in 0..N {
             let expected = vec![(i as u8).wrapping_mul(31).wrapping_add(7); 4096];

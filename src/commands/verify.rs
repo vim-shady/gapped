@@ -5,6 +5,7 @@ use crate::error::{GappedError, Result};
 use crate::fs::walk::walk_filesystem;
 use crate::model::entry::Entry;
 use crate::model::path::RelativePath;
+use crate::progress::Reporter;
 use log::info;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -12,14 +13,21 @@ use std::path::Path;
 /// Execute the verify command.
 /// Simulates applying the diff to the current filesystem state and checks the result
 /// against the target snapshot.
-pub fn run_verify(root_dir: &Path, diff_files: &[&Path], snapshot_path: &Path) -> Result<()> {
+pub fn run_verify(
+    root_dir: &Path,
+    diff_files: &[&Path],
+    snapshot_path: &Path,
+    reporter: &Reporter,
+) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
 
     info!("Loading snapshot from {}", snapshot_path.display());
+    let load_pb = reporter.spinner("Loading target snapshot");
     let (target_entries, _) = load_snapshot_entries(snapshot_path)?;
+    load_pb.finish_with_message(format!("Loaded {} entries from target snapshot", target_entries.len()));
 
     info!("Walk filesystem at {}", root_dir.display());
-    let (current_entries_vec, _) = walk_filesystem(&root_dir, None)?;
+    let (current_entries_vec, _) = walk_filesystem(&root_dir, None, reporter)?;
 
     let mut simulated: HashMap<RelativePath, Entry> = current_entries_vec
         .into_iter()
@@ -129,7 +137,7 @@ mod tests {
         copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         // modify source
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -140,7 +148,16 @@ mod tests {
         // small split size -> multiple chunks
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, Some(3072), false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            Some(3072),
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1, "expected split chunks");
@@ -156,7 +173,8 @@ mod tests {
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p: &PathBuf| p.as_path()).collect();
         // Applying these chunks to `target` (currently == original source)
         // should yield the state captured in snap2.
-        run_verify(&target, &chunk_refs, &snap2).expect("verify should succeed");
+        run_verify(&target, &chunk_refs, &snap2, &Reporter::hidden())
+            .expect("verify should succeed");
     }
 
     #[test]
@@ -167,7 +185,7 @@ mod tests {
         fs::write(target.join("extra.txt"), b"unexpected").unwrap();
 
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p: &PathBuf| p.as_path()).collect();
-        let result = run_verify(&target, &chunk_refs, &snap2);
+        let result = run_verify(&target, &chunk_refs, &snap2, &Reporter::hidden());
         assert!(result.is_err(), "verify should fail on discrepancy");
     }
 
@@ -189,7 +207,7 @@ mod tests {
         copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // in-place write does not bump source/sub/'s mtime, so the diff
@@ -198,7 +216,16 @@ mod tests {
 
         let diff = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff, &snap2, None, false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff,
+            &snap2,
+            None,
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         // Externally bump target/sub's mtime far away from snap2's value.
         // Without the implicit-dir handling, verify would surface this drift
@@ -214,7 +241,7 @@ mod tests {
         )
         .unwrap();
 
-        run_verify(&target, &[diff.as_path()], &snap2)
+        run_verify(&target, &[diff.as_path()], &snap2, &Reporter::hidden())
             .expect("verify must ignore drift on dirs apply will not touch");
     }
 
@@ -228,15 +255,25 @@ mod tests {
         copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(source.join("only.txt"), b"v2-longer").unwrap();
 
         let diff = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff, &snap2, None, false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff,
+            &snap2,
+            None,
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
-        run_verify(&target, &[diff.as_path()], &snap2).expect("single-file verify should pass");
+        run_verify(&target, &[diff.as_path()], &snap2, &Reporter::hidden())
+            .expect("single-file verify should pass");
     }
 }

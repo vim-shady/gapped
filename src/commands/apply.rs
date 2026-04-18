@@ -5,6 +5,7 @@ use crate::model::diff::{Change, ChangeKind, Diff};
 use crate::model::entry::{EntryKind, Metadata};
 use crate::model::path::RelativePath;
 use crate::parallel::{self, ContentReader, ContentSink};
+use crate::progress::Reporter;
 use crossbeam_channel::{Receiver, Sender};
 use log::{info, warn};
 use nix::unistd::{Gid, Uid};
@@ -43,7 +44,7 @@ struct StreamedFile {
     reader: ContentReader,
 }
 
-pub fn run_apply(root_dir: &Path, diff_files: &[&Path]) -> Result<()> {
+pub fn run_apply(root_dir: &Path, diff_files: &[&Path], _reporter: &Reporter) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
 
     // collect metadata, apply deletions and non-content changes
@@ -654,7 +655,7 @@ mod tests {
 
         // initila snapshot
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         // modify every file
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -667,7 +668,16 @@ mod tests {
 
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, Some(4096), false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            Some(4096),
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(
@@ -678,7 +688,7 @@ mod tests {
 
         // Apply
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
-        run_apply(&target, &chunk_refs).unwrap();
+        run_apply(&target, &chunk_refs, &Reporter::hidden()).unwrap();
 
         // Validate
         assert!(!target.join("file_00.txt").exists());
@@ -707,7 +717,7 @@ mod tests {
         copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..N {
@@ -717,11 +727,20 @@ mod tests {
 
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, None, false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            None,
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
-        run_apply(&target, &chunk_refs).unwrap();
+        run_apply(&target, &chunk_refs, &Reporter::hidden()).unwrap();
 
         for i in 0..N {
             let expected = vec![(i as u8).wrapping_mul(23).wrapping_add(1); 5000];
@@ -748,7 +767,7 @@ mod tests {
         copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..N {
@@ -757,7 +776,16 @@ mod tests {
 
         let diff = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff, &snap2, None, false).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff,
+            &snap2,
+            None,
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         // flip a byte deep inside the file
         let mut bytes = fs::read(&diff).unwrap();
@@ -777,7 +805,7 @@ mod tests {
 
         // a full apply reads through EOR and verifies the checksum, so the
         // corruption must surface as an error.
-        let result = run_apply(&target, &[diff.as_path()]);
+        let result = run_apply(&target, &[diff.as_path()], &Reporter::hidden());
         assert!(result.is_err(), "full apply must reject corrupted diff");
     }
 
@@ -795,7 +823,7 @@ mod tests {
         copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false).unwrap();
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..8 {
@@ -804,13 +832,22 @@ mod tests {
 
         let diff_base = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff_base, &snap2, Some(2048), true).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff_base,
+            &snap2,
+            Some(2048),
+            true,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
         assert!(chunks.len() > 1);
 
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
-        run_apply(&target, &chunk_refs).unwrap();
+        run_apply(&target, &chunk_refs, &Reporter::hidden()).unwrap();
 
         for i in 0..8 {
             let content = fs::read(target.join(format!("f_{:02}.bin", i))).unwrap();

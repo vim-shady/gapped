@@ -3,6 +3,7 @@ use crate::fs::hash::hash_file;
 use crate::fs::metadata::collect_metadata;
 use crate::model::entry::{Entry, EntryKind};
 use crate::model::path::RelativePath;
+use crate::progress::Reporter;
 use log::{info, warn};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::path::Path;
@@ -27,11 +28,13 @@ pub struct WalkStats {
 pub fn walk_filesystem(
     root: &Path,
     previous_entries: Option<&[Entry]>,
+    reporter: &Reporter,
 ) -> Result<(Vec<Entry>, WalkStats)> {
     let mut stats = WalkStats::default();
 
     let mut raw_entries = Vec::new();
 
+    let walk_pb = reporter.spinner("Walking filesystem");
     for dir_entry_result in WalkDir::new(root).follow_links(false) {
         let dir_entry = match dir_entry_result {
             Ok(dir_entry) => dir_entry,
@@ -92,8 +95,10 @@ pub fn walk_filesystem(
             continue;
         }
         stats.total_entries += 1;
+        walk_pb.inc(1);
         raw_entries.push((relative_path, kind, metadata, symlink_target));
     }
+    walk_pb.finish_with_message(format!("Walked {} entries", stats.total_entries));
 
     // Compute hashes for files in parallel, tracking hash outcome for stats
     #[derive(Clone, Copy)]
@@ -104,6 +109,7 @@ pub fn walk_filesystem(
         Error,
     }
 
+    let hash_pb = reporter.counter("Hashing files", stats.files as u64);
     let root_owned = root.to_path_buf();
     let results: Vec<(Option<Entry>, HashOutcome)> = raw_entries
         .par_iter()
@@ -129,6 +135,7 @@ pub fn walk_filesystem(
                 if prev_entry.kind == EntryKind::File
                     && prev_entry.metadata.size_and_mtime_match(metadata)
                 {
+                    hash_pb.inc(1);
                     return (
                         Some(Entry {
                             path: rel_path.clone(),
@@ -143,7 +150,7 @@ pub fn walk_filesystem(
             }
 
             let full_path = rel_path.to_full_path(&root_owned);
-            match hash_file(&full_path) {
+            let out = match hash_file(&full_path) {
                 Ok(hash) => (
                     Some(Entry {
                         path: rel_path.clone(),
@@ -158,7 +165,9 @@ pub fn walk_filesystem(
                     warn!("Cannot hash {}: {}", full_path.display(), e);
                     (None, HashOutcome::Error)
                 }
-            }
+            };
+            hash_pb.inc(1);
+            out
         })
         .collect();
 
@@ -222,7 +231,7 @@ mod tests {
     #[test]
     fn test_walk_counts() {
         let tmp = setup_test_tree();
-        let (entries, stats) = walk_filesystem(tmp.path(), None).unwrap();
+        let (entries, stats) = walk_filesystem(tmp.path(), None, &Reporter::hidden()).unwrap();
 
         assert_eq!(stats.directories, 4);
         assert_eq!(stats.files, 3);
@@ -237,7 +246,7 @@ mod tests {
     #[test]
     fn test_entries_sorted_by_path() {
         let tmp = setup_test_tree();
-        let (entries, _) = walk_filesystem(tmp.path(), None).unwrap();
+        let (entries, _) = walk_filesystem(tmp.path(), None, &Reporter::hidden()).unwrap();
 
         let paths: Vec<String> = entries.iter().map(|e| e.path.to_string()).collect();
 
@@ -251,14 +260,14 @@ mod tests {
         let tmp = setup_test_tree();
         let root = tmp.path();
 
-        let (prev_entries, stats) = walk_filesystem(root, None).unwrap();
+        let (prev_entries, stats) = walk_filesystem(root, None, &Reporter::hidden()).unwrap();
         assert_eq!(stats.files_hashed, 3);
         assert_eq!(stats.files_hash_reused, 0);
 
         std::fs::write(root.join("top.txt"), "changed").unwrap();
 
         // Second walk - 2 reused, 1 rehashed
-        let (_, stats) = walk_filesystem(root, Some(&prev_entries)).unwrap();
+        let (_, stats) = walk_filesystem(root, Some(&prev_entries), &Reporter::hidden()).unwrap();
         assert_eq!(stats.files_hashed, 1);
         assert_eq!(stats.files_hash_reused, 2);
     }

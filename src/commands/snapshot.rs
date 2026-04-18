@@ -5,6 +5,7 @@ use crate::format::writer::FormatWriter;
 use crate::fs::walk::walk_filesystem;
 use crate::model::entry::Entry;
 use crate::model::path::RelativePath;
+use crate::progress::Reporter;
 use log::info;
 use std::collections::HashMap;
 use std::fs::File;
@@ -48,6 +49,7 @@ pub fn run_snapshot(
     snapshot_out: &Path,
     snapshot_in: Option<&Path>,
     compress: bool,
+    reporter: &Reporter,
 ) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
 
@@ -55,8 +57,9 @@ pub fn run_snapshot(
     // can binary-search it directly.
     let previous_entries = if let Some(snapshot_in) = snapshot_in {
         info!("Loading previous snapshot from {}", snapshot_in.display());
+        let load_pb = reporter.spinner("Loading snapshot");
         let (entries, _header) = load_snapshot(snapshot_in)?;
-        info!("Loaded {} entries from previous snapshot", entries.len());
+        load_pb.finish_with_message(format!("Loaded {} entries from previous snapshot", entries.len()));
         Some(entries)
     } else {
         None
@@ -64,7 +67,7 @@ pub fn run_snapshot(
 
     // Walk the file system
     info!("Walking filesystem under {}", root_dir.display());
-    let (entries, stats) = walk_filesystem(&root_dir, previous_entries.as_deref())?;
+    let (entries, stats) = walk_filesystem(&root_dir, previous_entries.as_deref(), reporter)?;
 
     info!("Writing snapshot to {}", snapshot_out.display());
     let file = File::create(snapshot_out)?;
@@ -74,9 +77,12 @@ pub fn run_snapshot(
 
     let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
 
+    let write_pb = reporter.counter("Writing snapshot", entries.len() as u64);
     for entry in &entries {
         writer.write_snapshot_entry(entry)?;
+        write_pb.inc(1);
     }
+    write_pb.finish_with_message(format!("Wrote {} entries", entries.len()));
 
     writer.finish()?;
 
