@@ -33,39 +33,49 @@ impl TestFixture {
 
     /// Copy source to target using rsync
     pub fn sync_source_to_target(&self) {
-        let status = Command::new("rsync")
-            .args([
-                "-a",
-                &format!("{}/", self.source().display()),
-                &format!("{}/", self.target().display()),
-            ])
-            .status()
-            .expect("Failed to sync source to target");
-        assert!(status.success());
+        rsync_mirror(self.source(), self.target());
     }
 
     /// Verify source and target are identical using rsync
     pub fn verify_rsync_identical(&self) -> bool {
-        let output = Command::new("rsync")
-            .args([
-                "-avn", "--delete", "--checksum",
-                &format!("{}/", self.source().display()),
-                &format!("{}/", self.target().display()),
-            ])
-            .output()
-            .expect("Failed to verify source and target");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // rsync -avn output: if only stats lines, no differences
-        let lines: Vec<&str> = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .filter(|line| !line.starts_with("sending"))
-            .filter(|line| !line.starts_with("total size"))
-            .filter(|line| !line.starts_with("sent"))
-            .filter(|line| line.trim() != "./")
-            .collect();
-        lines.is_empty()
+        rsync_diff(self.source(), self.target()).is_empty()
     }
+}
+
+/// Mirror `source` into `target` with `rsync -a`. Panics on failure.
+pub fn rsync_mirror(source: &Path, target: &Path) {
+    let status = Command::new("rsync")
+        .args([
+            "-a",
+            &format!("{}/", source.display()),
+            &format!("{}/", target.display()),
+        ])
+        .status()
+        .expect("Failed to run rsync");
+    assert!(status.success(), "rsync -a mirror failed");
+}
+
+/// Return rsync's report of differences between two trees. Empty = identical.
+pub fn rsync_diff(source: &Path, target: &Path) -> Vec<String> {
+    let output = Command::new("rsync")
+        .args([
+            "-avn",
+            "--delete",
+            "--checksum",
+            &format!("{}/", source.display()),
+            &format!("{}/", target.display()),
+        ])
+        .output()
+        .expect("Failed to run rsync");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter(|l| !l.starts_with("sending"))
+        .filter(|l| !l.starts_with("sent"))
+        .filter(|l| !l.starts_with("total size"))
+        .filter(|l| l.trim() != "./")
+        .map(|l| l.to_string())
+        .collect()
 }
 
 /// Get gapped binary path
