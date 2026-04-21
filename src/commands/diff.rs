@@ -52,7 +52,9 @@ pub fn run_diff(
 
     // Compute diff
     info!("Computing diff");
+    let compute_pb = reporter.spinner("Computing diff");
     let changes = compute_diff(&old_entries, &new_entries, &root_dir)?;
+    compute_pb.finish_with_message(format!("Computed {} changes", changes.len()));
 
     let (mut added_count, mut modified_count, mut removed_count) = (0, 0, 0);
     for change in &changes {
@@ -72,6 +74,7 @@ pub fn run_diff(
             &root_dir,
             max_bytes,
             compress,
+            reporter,
         )?;
     } else {
         write_single_diff(
@@ -80,12 +83,13 @@ pub fn run_diff(
             source_snapshot_hash,
             &root_dir,
             compress,
+            reporter,
         )?;
     }
 
     // Write new snapshot
     info!("Writing new snapshot to {}", snapshot_out.display());
-    write_snapshot(snapshot_out, &new_entries, &root_dir, compress)?;
+    write_snapshot(snapshot_out, &new_entries, &root_dir, compress, reporter)?;
 
     // Report stats
     eprintln!("Diff complete:");
@@ -106,6 +110,7 @@ fn write_snapshot(
     entries: &[Entry],
     root_dir: &Path,
     compress: bool,
+    reporter: &Reporter,
 ) -> Result<()> {
     let file = File::create(snapshot_out)?;
     let buf_writer = BufWriter::new(file);
@@ -114,9 +119,12 @@ fn write_snapshot(
 
     let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
 
+    let pb = reporter.counter("Writing new snapshot", entries.len() as u64);
     for entry in entries {
         writer.write_snapshot_entry(entry)?;
+        pb.inc(1);
     }
+    pb.finish_with_message(format!("Wrote {} entries", entries.len()));
 
     writer.finish()?;
     Ok(())
@@ -128,6 +136,7 @@ fn write_single_diff(
     source_snapshot_hash: [u8; 16],
     root_dir: &Path,
     compress: bool,
+    reporter: &Reporter,
 ) -> Result<()> {
     let file = File::create(diff_out)?;
     let buf_writer = BufWriter::new(file);
@@ -136,20 +145,27 @@ fn write_single_diff(
     let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
 
     // Section 1: all DiffChange records.
+    let meta_pb = reporter.counter("Writing diff metadata", changes.len() as u64);
     for change in changes {
         writer.write_diff_change(change)?;
+        meta_pb.inc(1);
     }
+    meta_pb.finish_with_message(format!("Wrote {} diff records", changes.len()));
 
     // Section 2: FileContent records, in change-list order. Reader threads
     // prefetch the next files while the writer streams the current one; the
     // writer itself stays serial so the zstd encoder + rolling hash see bytes
     // in order.
+    let content_count = changes.iter().filter(|c| c.has_content()).count() as u64;
+    let content_pb = reporter.counter("Writing diff content", content_count);
     let mut pool = PrefetchPool::new(content_paths(changes, root_dir));
     while let Some(mut reader) = pool.next()? {
         let size = reader.remaining();
         writer.write_file_content_from_reader(&mut reader, size)?;
+        content_pb.inc(1);
     }
     pool.finish()?;
+    content_pb.finish_with_message(format!("Wrote {} content files", content_count));
 
     writer.finish()?;
     Ok(())
@@ -176,6 +192,7 @@ fn write_split_diff(
     root_dir: &Path,
     max_bytes: u64,
     compress: bool,
+    reporter: &Reporter,
 ) -> Result<()> {
     if changes.is_empty() {
         return Ok(());
@@ -187,6 +204,10 @@ fn write_split_diff(
         create_chunk_writer(&diff_out_str, chunk_number, source_snapshot_hash, compress)?;
 
     let mut pool = PrefetchPool::new(content_paths(changes, root_dir));
+
+    let meta_pb = reporter.counter("Writing diff metadata", changes.len() as u64);
+    let content_count = changes.iter().filter(|c| c.has_content()).count() as u64;
+    let content_pb = reporter.counter("Writing diff content", content_count);
 
     // dc_cursor points at the next change whose DiffChange still needs to be
     // written. fc_cursor points at the next change whose content still
@@ -204,6 +225,7 @@ fn write_split_diff(
             if reader.remaining() == 0 {
                 partial = None;
                 fc_cursor += 1;
+                content_pb.inc(1);
             } else {
                 writer.finish()?;
                 chunk_number += 1;
@@ -221,6 +243,7 @@ fn write_split_diff(
         while dc_cursor < changes.len() && writer.bytes_written() < max_bytes {
             writer.write_diff_change(&changes[dc_cursor])?;
             dc_cursor += 1;
+            meta_pb.inc(1);
         }
 
         // Section 2 (FileContent): emit content for committed changes in
@@ -241,6 +264,7 @@ fn write_split_diff(
             write_content_fragment(&mut writer, &mut reader, max_bytes)?;
             if reader.remaining() == 0 {
                 fc_cursor += 1;
+                content_pb.inc(1);
             } else {
                 partial = Some(reader);
                 break;
@@ -259,6 +283,8 @@ fn write_split_diff(
 
     writer.finish()?;
     pool.finish()?;
+    meta_pb.finish_with_message(format!("Wrote {} diff records", changes.len()));
+    content_pb.finish_with_message(format!("Wrote {} content files", content_count));
     info!("Wrote {} diff chunks", chunk_number);
     Ok(())
 }
@@ -1029,7 +1055,7 @@ mod tests {
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(source.join("f_000.dat"), b"updated").unwrap();
 
         let diff = tmp.path().join("diff.gapped");
@@ -1053,7 +1079,7 @@ mod tests {
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         // modify every file so the diff contains changes for every file
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..10 {
             fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'b'; 2048]).unwrap();
         }
@@ -1097,7 +1123,7 @@ mod tests {
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         // 15 modifications + 1 addition + 1 removal = 17 changes
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..15 {
             fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'b'; 1024]).unwrap();
         }
@@ -1136,7 +1162,7 @@ mod tests {
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..6 {
             fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'z'; 2048]).unwrap();
         }
@@ -1175,7 +1201,7 @@ mod tests {
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..8 {
             fs::write(source.join(format!("f_{:03}.dat", i)), vec![b'c'; 2048]).unwrap();
         }
@@ -1226,7 +1252,7 @@ mod tests {
 
         // mdify every file with distinct content to test the parallel
         // read + in-order write path under split-chunks.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..N {
             let fill = (i as u8).wrapping_mul(31).wrapping_add(7);
             fs::write(source.join(format!("f_{:03}.bin", i)), vec![fill; 4096]).unwrap();

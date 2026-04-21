@@ -34,11 +34,19 @@ pub fn run_verify(
         .map(|entry| (entry.path.clone(), entry))
         .collect();
 
+    let parse_pb = reporter.spinner("Reading diff metadata");
     let changes = parse_diff_metadata(diff_files)?;
+    parse_pb.finish_with_message(format!("Read {} changes from diff", changes.len()));
     info!("Simulating applying diff ({} changes)", changes.len());
-    let implicit_dirs = simulate_apply(&mut simulated, &changes);
 
+    let sim_pb = reporter.spinner("Simulating apply");
+    let implicit_dirs = simulate_apply(&mut simulated, &changes);
+    sim_pb.finish_and_clear();
+
+    let cmp_pb = reporter.spinner("Comparing entries");
     let discrepancies = compare_entries(&simulated, &target_entries, &implicit_dirs);
+    cmp_pb.finish_and_clear();
+
     for msg in &discrepancies {
         eprintln!("{}", msg);
     }

@@ -7,6 +7,7 @@ use crate::model::path::RelativePath;
 use crate::parallel::{self, ContentReader, ContentSink};
 use crate::progress::Reporter;
 use crossbeam_channel::{Receiver, Sender};
+use indicatif::ProgressBar;
 use log::{info, warn};
 use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -44,20 +45,22 @@ struct StreamedFile {
     reader: ContentReader,
 }
 
-pub fn run_apply(root_dir: &Path, diff_files: &[&Path], _reporter: &Reporter) -> Result<()> {
+pub fn run_apply(root_dir: &Path, diff_files: &[&Path], reporter: &Reporter) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
 
     // collect metadata, apply deletions and non-content changes
+    let parse_pb = reporter.spinner("Reading diff metadata");
     let changes = parse_diff_metadata(diff_files)?;
+    parse_pb.finish_with_message(format!("Read {} changes from diff", changes.len()));
     info!("Applying {} changes", changes.len());
 
     let saved_dir_mtimes = save_parent_dir_mtimes(&changes, &root_dir);
-    let (del_count, mut err_count) = apply_deletions(&changes, &root_dir);
-    let first_pass = apply_non_content_changes(&changes, &root_dir);
+    let (del_count, mut err_count) = apply_deletions(&changes, &root_dir, reporter);
+    let first_pass = apply_non_content_changes(&changes, &root_dir, reporter);
     err_count += first_pass.err_count;
 
     // stream file content directly to disk
-    let second_pass = stream_file_contents(diff_files, &root_dir)?;
+    let second_pass = stream_file_contents(diff_files, &root_dir, &changes, reporter)?;
     err_count += second_pass.err_count;
 
     restore_directory_mtimes(
@@ -164,13 +167,18 @@ fn save_parent_dir_mtimes(all_changes: &[Change], root_dir: &Path) -> HashMap<Pa
 }
 
 /// Apply all deletion changes (deepest paths first). Returns (delete_count, err_count).
-fn apply_deletions(all_changes: &[Change], root_dir: &Path) -> (usize, usize) {
+fn apply_deletions(
+    all_changes: &[Change],
+    root_dir: &Path,
+    reporter: &Reporter,
+) -> (usize, usize) {
     let mut deletions: Vec<&Change> = all_changes
         .iter()
         .filter(|c| matches!(c.kind, ChangeKind::Removed(_)))
         .collect();
     deletions.sort_by(|a, b| b.path.depth().cmp(&a.path.depth()));
 
+    let pb = reporter.counter("Applying deletions", deletions.len() as u64);
     let mut delete_count = 0;
     let mut err_count = 0;
     for change in deletions {
@@ -188,25 +196,33 @@ fn apply_deletions(all_changes: &[Change], root_dir: &Path) -> (usize, usize) {
                 }
             }
         }
+        pb.inc(1);
     }
+    pb.finish_with_message(format!("Deleted {} entries", delete_count));
     (delete_count, err_count)
 }
 
 /// Apply additions and modifications that don't require file content (directories,
 /// symlinks, metadata-only changes). File content writes are handled by `stram_file_contents`.
-fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyResult {
+fn apply_non_content_changes(
+    all_changes: &[Change],
+    root_dir: &Path,
+    reporter: &Reporter,
+) -> ApplyResult {
     let mut items: Vec<&Change> = all_changes
         .iter()
         .filter(|c| matches!(c.kind, ChangeKind::Added(_) | ChangeKind::Modified(_)))
         .collect();
     items.sort_by(|a, b| a.path.depth().cmp(&b.path.depth()));
 
+    let pb = reporter.counter("Applying changes", items.len() as u64);
     let mut add_count = 0;
     let mut mod_count = 0;
     let mut err_count = 0;
     let mut dir_metadata_changes: Vec<(RelativePath, Metadata)> = Vec::new();
 
     for change in &items {
+        pb.inc(1);
         let full_path = change.path.to_full_path(root_dir);
         match &change.kind {
             ChangeKind::Added(added) => {
@@ -276,6 +292,7 @@ fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyRe
             _ => unreachable!(),
         }
     }
+    pb.finish_with_message(format!("Applied {} add/modify changes", items.len()));
 
     ApplyResult {
         add_count,
@@ -292,11 +309,19 @@ fn apply_non_content_changes(all_changes: &[Change], root_dir: &Path) -> ApplyRe
 /// (carrying the reader end) to a worker pool, then streams `FileContent`
 /// record payloads into the writer end via `ContentSink`. Workers write to
 /// a tempfile via `io::copy`, rename, and apply metadata in parallel.
-fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamResult> {
+fn stream_file_contents(
+    diff_files: &[&Path],
+    root_dir: &Path,
+    changes: &[Change],
+    reporter: &Reporter,
+) -> Result<StreamResult> {
+    let content_count = changes.iter().filter(|c| c.has_content()).count() as u64;
+    let pb = reporter.counter("Writing file content", content_count);
+
     let workers = parallel::worker_count();
     let (tx, rx) = crossbeam_channel::bounded::<StreamedFile>(workers);
 
-    let handles = spawn_write_workers(workers, rx, root_dir);
+    let handles = spawn_write_workers(workers, rx, root_dir, pb.clone());
 
     let read_res = read_diff_and_dispatch(diff_files, &tx);
     drop(tx);
@@ -310,6 +335,7 @@ fn stream_file_contents(diff_files: &[&Path], root_dir: &Path) -> Result<StreamR
     // Surface reader error only after workers have joined so threads are
     // not leaked on an early return.
     read_res?;
+    pb.finish_with_message(format!("Wrote {} files", content_count));
     Ok(total)
 }
 
@@ -317,15 +343,18 @@ fn spawn_write_workers(
     workers: usize,
     rx: Receiver<StreamedFile>,
     root_dir: &Path,
+    pb: ProgressBar,
 ) -> Vec<thread::JoinHandle<StreamResult>> {
     (0..workers)
         .map(|_| {
             let rx = rx.clone();
             let root = root_dir.to_path_buf();
+            let pb = pb.clone();
             thread::spawn(move || {
                 let mut local = StreamResult::default();
                 for job in rx.iter() {
                     process_streamed_file(job, &root, &mut local);
+                    pb.inc(1);
                 }
                 local
             })
