@@ -1,6 +1,7 @@
 use crossbeam_channel::{Receiver, Sender};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::error::{GappedError, Result};
@@ -84,32 +85,49 @@ impl Read for ContentReader {
     }
 }
 
-/// A `Write` that forwards bytes into a bounded chunk channel.
+/// A byte-sized semaphore bounding total in-flight payload memory.
 ///
-/// Mirror of `ContentReader`: the producer side of the same bounded pipe.
-/// Dropping the sink closes the channel, consumer sees EOF.
-pub struct ContentSink {
-    chunk_tx: Sender<Chunk>,
+/// Unlike a file-count semaphore, this caps memory directly: a caller about
+/// to buffer an N-byte payload calls `acquire(N)`, which blocks until N
+/// permits are free, then deducts them. The worker that eventually consumes
+/// the payload calls `release(N)`, returning
+/// the permits to the pool.
+///
+/// If a single requested `bytes` exceeds `capacity`, `acquire` holds to
+/// `capacity` rather than deadlocking — the oversized payload becomes
+/// exclusive in-flight for its duration.
+pub struct ByteBudget {
+    inner: Mutex<u64>,
+    cv: Condvar,
+    capacity: u64,
 }
 
-impl ContentSink {
-    pub fn new(chunk_tx: Sender<Chunk>) -> Self {
-        Self { chunk_tx }
+impl ByteBudget {
+    pub fn new(capacity: u64) -> Arc<Self> {
+        let capacity = capacity.max(1);
+        Arc::new(Self {
+            inner: Mutex::new(capacity),
+            cv: Condvar::new(),
+            capacity,
+        })
     }
-}
 
-impl Write for ContentSink {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if data.is_empty() {
-            return Ok(0);
+    pub fn acquire(&self, bytes: u64) -> u64 {
+        let permits = bytes.min(self.capacity).max(1);
+        let mut avail = self.inner.lock().unwrap();
+        while *avail < permits {
+            avail = self.cv.wait(avail).unwrap();
         }
-        self.chunk_tx
-            .send(Ok(data.to_vec()))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "consumer gone"))?;
-        Ok(data.len())
+        *avail -= permits;
+        permits
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    pub fn release(&self, permits: u64) {
+        if permits == 0 {
+            return;
+        }
+        let mut avail = self.inner.lock().unwrap();
+        *avail = (*avail + permits).min(self.capacity);
+        self.cv.notify_all();
     }
 }

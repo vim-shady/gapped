@@ -4,7 +4,7 @@ use crate::format::reader::FormatReader;
 use crate::model::diff::{Change, ChangeKind, Diff};
 use crate::model::entry::{EntryKind, Metadata};
 use crate::model::path::RelativePath;
-use crate::parallel::{self, ContentReader, ContentSink};
+use crate::parallel::{self, ByteBudget};
 use crate::progress::Reporter;
 use crossbeam_channel::{Receiver, Sender};
 use indicatif::ProgressBar;
@@ -13,10 +13,15 @@ use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::{File, Permissions};
-use std::io::{self, BufReader};
+use std::io::{BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
+
+/// Cap on total in-flight file payload bytes across the dispatcher and
+/// workers. Limits peak memory regardless of file sizes or concurrency.
+const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 struct ApplyResult {
     add_count: usize,
@@ -40,9 +45,24 @@ impl StreamResult {
     }
 }
 
+/// RAII based release of `ByteBudget` permits held while a payload is in flight.
+/// The permits return to the pool whether the worker succeeds, fails, or
+/// panics, keeping the dispatcher from deadlocking on an error path.
+struct BudgetPermit {
+    budget: Arc<ByteBudget>,
+    permits: u64,
+}
+
+impl Drop for BudgetPermit {
+    fn drop(&mut self) {
+        self.budget.release(self.permits);
+    }
+}
+
 struct StreamedFile {
     change: Change,
-    reader: ContentReader,
+    payload: Vec<u8>,
+    _permit: BudgetPermit,
 }
 
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path], reporter: &Reporter) -> Result<()> {
@@ -167,11 +187,7 @@ fn save_parent_dir_mtimes(all_changes: &[Change], root_dir: &Path) -> HashMap<Pa
 }
 
 /// Apply all deletion changes (deepest paths first). Returns (delete_count, err_count).
-fn apply_deletions(
-    all_changes: &[Change],
-    root_dir: &Path,
-    reporter: &Reporter,
-) -> (usize, usize) {
+fn apply_deletions(all_changes: &[Change], root_dir: &Path, reporter: &Reporter) -> (usize, usize) {
     let mut deletions: Vec<&Change> = all_changes
         .iter()
         .filter(|c| matches!(c.kind, ChangeKind::Removed(_)))
@@ -305,10 +321,10 @@ fn apply_non_content_changes(
 /// Re-open diff files and stream file content to disk in parallel.
 ///
 /// The dispatcher reads diff records sequentially and, for each content
-/// change, creates a bounded chunk channel. It dispatches a `StreamedFile`
-/// (carrying the reader end) to a worker pool, then streams `FileContent`
-/// record payloads into the writer end via `ContentSink`. Workers write to
-/// a tempfile via `io::copy`, rename, and apply metadata in parallel.
+/// change, acquires bytes from a shared `ByteBudget`, buffers the payload,
+/// and hands off a `StreamedFile` to a worker pool. Workers write the
+/// buffer to a tempfile, rename, and apply metadata in parallel. the budget
+/// permits are released when the job is dropped.
 fn stream_file_contents(
     diff_files: &[&Path],
     root_dir: &Path,
@@ -320,10 +336,11 @@ fn stream_file_contents(
 
     let workers = parallel::worker_count();
     let (tx, rx) = crossbeam_channel::bounded::<StreamedFile>(workers);
+    let budget = ByteBudget::new(DEFAULT_BUDGET_BYTES);
 
     let handles = spawn_write_workers(workers, rx, root_dir, pb.clone());
 
-    let read_res = read_diff_and_dispatch(diff_files, &tx);
+    let read_res = read_diff_and_dispatch(diff_files, &tx, &budget);
     drop(tx);
 
     let mut total = StreamResult::default();
@@ -381,11 +398,24 @@ fn expected_content_size(change: &Change) -> u64 {
 /// Each chunk stores all `DiffChange` records first, then all `FileContent`
 /// records. Pairing is by position across the whole diff.
 /// A single file may span multiple `FileContent` records when the diff is
-/// split; completion is detected by tracking `remaining` bytes against the
-/// expected size from the change metadata.
-fn read_diff_and_dispatch(diff_files: &[&Path], tx: &Sender<StreamedFile>) -> Result<()> {
+/// split. The dispatcher accumulates them into one buffer, then hands the
+/// whole payload off in a single `StreamedFile`. Memory is bounded by
+/// `ByteBudget` permits acquired before reading a file's first record and
+/// released when the worker drops the job.
+fn read_diff_and_dispatch(
+    diff_files: &[&Path],
+    tx: &Sender<StreamedFile>,
+    budget: &Arc<ByteBudget>,
+) -> Result<()> {
+    struct Active {
+        change: Change,
+        payload: Vec<u8>,
+        remaining: u64,
+        permit: BudgetPermit,
+    }
+
     let mut queue: VecDeque<(Change, u64)> = VecDeque::new();
-    let mut active: Option<(ContentSink, u64)> = None;
+    let mut active: Option<Active> = None;
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
@@ -405,32 +435,43 @@ fn read_diff_and_dispatch(diff_files: &[&Path], tx: &Sender<StreamedFile>) -> Re
                 }
                 RecordType::FileContent => {
                     if active.is_none() {
-                        let (change, size) =
-                            queue.pop_front().ok_or_else(|| {
-                                GappedError::InvalidFormat(
-                                    "FileContent record with no pending change".into(),
-                                )
-                            })?;
-                        let (chunk_tx, chunk_rx) = parallel::chunk_channel();
-                        let content_reader = ContentReader::new(chunk_rx, size);
-                        tx.send(StreamedFile {
-                            change,
-                            reader: content_reader,
-                        })
-                        .map_err(|_| {
-                            GappedError::WorkerPoolFailure(
-                                "worker pool closed during dispatch",
+                        let (change, size) = queue.pop_front().ok_or_else(|| {
+                            GappedError::InvalidFormat(
+                                "FileContent record with no pending change".into(),
                             )
                         })?;
-                        active = Some((ContentSink::new(chunk_tx), size));
+                        let permits = budget.acquire(size);
+                        let permit = BudgetPermit {
+                            budget: Arc::clone(budget),
+                            permits,
+                        };
+                        active = Some(Active {
+                            change,
+                            payload: Vec::with_capacity(size as usize),
+                            remaining: size,
+                            permit,
+                        });
                     }
 
-                    let (sink, remaining) = active.as_mut().unwrap();
-                    format_reader.copy_payload_to(record.payload_len, sink)?;
-                    *remaining = remaining.saturating_sub(record.payload_len);
+                    let a = active.as_mut().unwrap();
+                    format_reader.copy_payload_to(record.payload_len, &mut a.payload)?;
+                    a.remaining = a.remaining.saturating_sub(record.payload_len);
 
-                    if *remaining == 0 {
-                        active = None;
+                    if a.remaining == 0 {
+                        let Active {
+                            change,
+                            payload,
+                            permit,
+                            ..
+                        } = active.take().unwrap();
+                        tx.send(StreamedFile {
+                            change,
+                            payload,
+                            _permit: permit,
+                        })
+                        .map_err(|_| {
+                            GappedError::WorkerPoolFailure("worker pool closed during dispatch")
+                        })?;
                     }
                 }
                 _ => format_reader.skip_payload(record.payload_len)?,
@@ -448,7 +489,7 @@ fn read_diff_and_dispatch(diff_files: &[&Path], tx: &Sender<StreamedFile>) -> Re
 
 fn process_streamed_file(job: StreamedFile, root_dir: &Path, result: &mut StreamResult) {
     let is_add = matches!(&job.change.kind, ChangeKind::Added(_));
-    if write_streamed_file(&job.change, job.reader, root_dir) {
+    if write_streamed_file(&job.change, &job.payload, root_dir) {
         if is_add {
             result.add_count += 1;
         } else {
@@ -459,8 +500,8 @@ fn process_streamed_file(job: StreamedFile, root_dir: &Path, result: &mut Stream
     }
 }
 
-/// Stream a file from its `ContentReader` to a tempfile, persist, set metadata.
-fn write_streamed_file(change: &Change, mut reader: ContentReader, root_dir: &Path) -> bool {
+/// Write a buffered payload to a tempfile, persist it, and apply metadata.
+fn write_streamed_file(change: &Change, payload: &[u8], root_dir: &Path) -> bool {
     let full_path = change.path.to_full_path(root_dir);
     let parent = full_path.parent().unwrap_or(Path::new("."));
 
@@ -476,7 +517,7 @@ fn write_streamed_file(change: &Change, mut reader: ContentReader, root_dir: &Pa
         }
     };
 
-    if let Err(e) = io::copy(&mut reader, temp.as_file_mut()) {
+    if let Err(e) = temp.as_file_mut().write_all(payload) {
         warn!(
             "Failed to write file content for {}: {}",
             full_path.display(),
