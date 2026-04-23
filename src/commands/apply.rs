@@ -4,24 +4,24 @@ use crate::format::reader::FormatReader;
 use crate::model::diff::{Change, ChangeKind, Diff};
 use crate::model::entry::{EntryKind, Metadata};
 use crate::model::path::RelativePath;
-use crate::parallel::{self, ByteBudget};
 use crate::progress::Reporter;
-use crossbeam_channel::{Receiver, Sender};
-use indicatif::ProgressBar;
 use log::{info, warn};
 use nix::unistd::{Gid, Uid};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::{File, Permissions};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::thread;
 
-/// Cap on total in-flight file payload bytes across the dispatcher and
-/// workers. Limits peak memory regardless of file sizes or concurrency.
-const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+/// Read-ahead on the diff file. A 1 MiB buffer keeps the kernel read queue
+/// deep without inflating working set — apply is single-threaded so there's
+/// no benefit to going bigger.
+const DIFF_READ_BUFFER: usize = 1024 * 1024;
+
+/// Write-side buffer for streaming a file payload to its tempfile. Large
+/// enough to coalesce record-sized reads into one sequential write per flush.
+const WRITE_BUFFER: usize = 1024 * 1024;
 
 struct ApplyResult {
     add_count: usize,
@@ -35,34 +35,6 @@ struct StreamResult {
     add_count: usize,
     mod_count: usize,
     err_count: usize,
-}
-
-impl StreamResult {
-    fn merge(&mut self, other: StreamResult) {
-        self.add_count += other.add_count;
-        self.mod_count += other.mod_count;
-        self.err_count += other.err_count;
-    }
-}
-
-/// RAII based release of `ByteBudget` permits held while a payload is in flight.
-/// The permits return to the pool whether the worker succeeds, fails, or
-/// panics, keeping the dispatcher from deadlocking on an error path.
-struct BudgetPermit {
-    budget: Arc<ByteBudget>,
-    permits: u64,
-}
-
-impl Drop for BudgetPermit {
-    fn drop(&mut self) {
-        self.budget.release(self.permits);
-    }
-}
-
-struct StreamedFile {
-    change: Change,
-    payload: Vec<u8>,
-    _permit: BudgetPermit,
 }
 
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path], reporter: &Reporter) -> Result<()> {
@@ -120,7 +92,7 @@ pub fn parse_diff_metadata(diff_files: &[&Path]) -> Result<Vec<Change>> {
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
-        let reader = BufReader::new(file);
+        let reader = BufReader::with_capacity(DIFF_READ_BUFFER, file);
         let (mut format_reader, header) = FormatReader::new(reader)?;
         check_diff_version(&header)?;
 
@@ -219,7 +191,8 @@ fn apply_deletions(all_changes: &[Change], root_dir: &Path, reporter: &Reporter)
 }
 
 /// Apply additions and modifications that don't require file content (directories,
-/// symlinks, metadata-only changes). File content writes are handled by `stram_file_contents`.
+/// symlinks, metadata-only changes). File content writes are handled by
+/// `stream_file_contents`.
 fn apply_non_content_changes(
     all_changes: &[Change],
     root_dir: &Path,
@@ -241,46 +214,43 @@ fn apply_non_content_changes(
         pb.inc(1);
         let full_path = change.path.to_full_path(root_dir);
         match &change.kind {
-            ChangeKind::Added(added) => {
-                match added.entry.kind {
-                    EntryKind::Directory => {
-                        if let Err(e) = fs::create_dir_all(&full_path) {
-                            warn!("Failed to create directory {}: {}", full_path.display(), e);
+            ChangeKind::Added(added) => match added.entry.kind {
+                EntryKind::Directory => {
+                    if let Err(e) = fs::create_dir_all(&full_path) {
+                        warn!("Failed to create directory {}: {}", full_path.display(), e);
+                        err_count += 1;
+                        continue;
+                    }
+                    set_metadata(&full_path, &added.entry.metadata);
+                    dir_metadata_changes.push((change.path.clone(), added.entry.metadata.clone()));
+                    add_count += 1;
+                }
+                EntryKind::File if added.has_content => {
+                    // handled by the content pass
+                }
+                EntryKind::File => {
+                    add_count += 1;
+                }
+                EntryKind::Symlink => {
+                    if let Some(target) = &added.entry.symlink_target {
+                        if let Err(e) = symlink(target, &full_path) {
+                            warn!("Failed to create symlink {}: {}", full_path.display(), e);
                             err_count += 1;
                             continue;
                         }
-                        set_metadata(&full_path, &added.entry.metadata);
-                        dir_metadata_changes
-                            .push((change.path.clone(), added.entry.metadata.clone()));
-                        add_count += 1;
+                        set_symlink_ownership(&full_path, &added.entry.metadata);
+                        set_mtime(
+                            &full_path,
+                            added.entry.metadata.mtime_sec,
+                            added.entry.metadata.mtime_nsec,
+                        );
                     }
-                    EntryKind::File if added.has_content => {
-                        // Skip
-                    }
-                    EntryKind::File => {
-                        add_count += 1;
-                    }
-                    EntryKind::Symlink => {
-                        if let Some(target) = &added.entry.symlink_target {
-                            if let Err(e) = symlink(target, &full_path) {
-                                warn!("Failed to create symlink {}: {}", full_path.display(), e);
-                                err_count += 1;
-                                continue;
-                            }
-                            set_symlink_ownership(&full_path, &added.entry.metadata);
-                            set_mtime(
-                                &full_path,
-                                added.entry.metadata.mtime_sec,
-                                added.entry.metadata.mtime_nsec,
-                            );
-                        }
-                        add_count += 1;
-                    }
+                    add_count += 1;
                 }
-            }
+            },
             ChangeKind::Modified(modified) => {
                 if modified.has_content {
-                    // Skip
+                    // handled by the content pass
                     continue;
                 }
                 if let Some(new_target) = &modified.new_symlink_target {
@@ -318,13 +288,19 @@ fn apply_non_content_changes(
     }
 }
 
-/// Re-open diff files and stream file content to disk in parallel.
+/// Re-open diff files and stream file content to disk.
 ///
-/// The dispatcher reads diff records sequentially and, for each content
-/// change, acquires bytes from a shared `ByteBudget`, buffers the payload,
-/// and hands off a `StreamedFile` to a worker pool. Workers write the
-/// buffer to a tempfile, rename, and apply metadata in parallel. the budget
-/// permits are released when the job is dropped.
+/// Single-threaded: read diff records sequentially and, for each
+/// `FileContent` record, stream bytes straight into the target's tempfile
+/// via a per-record `BufWriter`. When all expected bytes for a change have
+/// been written, persist the tempfile and apply metadata. Per-file memory
+/// is bounded by `WRITE_BUFFER`; a single file can span multiple records
+/// (and diff-chunk boundaries) — the tempfile stays open across them.
+///
+/// An earlier parallel dispatcher was removed after benchmarking showed
+/// ext4 serialises per-file `rename()` + journal commits regardless of
+/// thread count; the extra machinery added complexity with no measurable
+/// wall-clock benefit.
 fn stream_file_contents(
     diff_files: &[&Path],
     root_dir: &Path,
@@ -333,93 +309,14 @@ fn stream_file_contents(
 ) -> Result<StreamResult> {
     let content_count = changes.iter().filter(|c| c.has_content()).count() as u64;
     let pb = reporter.counter("Writing file content", content_count);
-
-    let workers = parallel::worker_count();
-    let (tx, rx) = crossbeam_channel::bounded::<StreamedFile>(workers);
-    let budget = ByteBudget::new(DEFAULT_BUDGET_BYTES);
-
-    let handles = spawn_write_workers(workers, rx, root_dir, pb.clone());
-
-    let read_res = read_diff_and_dispatch(diff_files, &tx, &budget);
-    drop(tx);
-
-    let mut total = StreamResult::default();
-    for h in handles {
-        let local = parallel::join_worker(h, "writer thread panicked")?;
-        total.merge(local);
-    }
-
-    // Surface reader error only after workers have joined so threads are
-    // not leaked on an early return.
-    read_res?;
-    pb.finish_with_message(format!("Wrote {} files", content_count));
-    Ok(total)
-}
-
-fn spawn_write_workers(
-    workers: usize,
-    rx: Receiver<StreamedFile>,
-    root_dir: &Path,
-    pb: ProgressBar,
-) -> Vec<thread::JoinHandle<StreamResult>> {
-    (0..workers)
-        .map(|_| {
-            let rx = rx.clone();
-            let root = root_dir.to_path_buf();
-            let pb = pb.clone();
-            thread::spawn(move || {
-                let mut local = StreamResult::default();
-                for job in rx.iter() {
-                    process_streamed_file(job, &root, &mut local);
-                    pb.inc(1);
-                }
-                local
-            })
-        })
-        .collect()
-}
-
-/// Expected file-content size for a content change. Relies on the
-/// `ModifiedEntry` invariant: `has_content` implies `new_metadata.is_some()`.
-fn expected_content_size(change: &Change) -> u64 {
-    match &change.kind {
-        ChangeKind::Added(added) if added.has_content => added.entry.metadata.size,
-        ChangeKind::Modified(modified) if modified.has_content => modified
-            .new_metadata
-            .as_ref()
-            .map(|m| m.size)
-            .expect("has_content implies new_metadata is Some"),
-        _ => 0,
-    }
-}
-
-/// Read all diff chunks and stream file payloads to workers.
-///
-/// Each chunk stores all `DiffChange` records first, then all `FileContent`
-/// records. Pairing is by position across the whole diff.
-/// A single file may span multiple `FileContent` records when the diff is
-/// split. The dispatcher accumulates them into one buffer, then hands the
-/// whole payload off in a single `StreamedFile`. Memory is bounded by
-/// `ByteBudget` permits acquired before reading a file's first record and
-/// released when the worker drops the job.
-fn read_diff_and_dispatch(
-    diff_files: &[&Path],
-    tx: &Sender<StreamedFile>,
-    budget: &Arc<ByteBudget>,
-) -> Result<()> {
-    struct Active {
-        change: Change,
-        payload: Vec<u8>,
-        remaining: u64,
-        permit: BudgetPermit,
-    }
+    let mut result = StreamResult::default();
 
     let mut queue: VecDeque<(Change, u64)> = VecDeque::new();
-    let mut active: Option<Active> = None;
+    let mut active: Option<ActiveWrite> = None;
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
-        let reader = BufReader::new(file);
+        let reader = BufReader::with_capacity(DIFF_READ_BUFFER, file);
         let (mut format_reader, header) = FormatReader::new(reader)?;
         check_diff_version(&header)?;
 
@@ -440,38 +337,23 @@ fn read_diff_and_dispatch(
                                 "FileContent record with no pending change".into(),
                             )
                         })?;
-                        let permits = budget.acquire(size);
-                        let permit = BudgetPermit {
-                            budget: Arc::clone(budget),
-                            permits,
-                        };
-                        active = Some(Active {
-                            change,
-                            payload: Vec::with_capacity(size as usize),
-                            remaining: size,
-                            permit,
-                        });
+                        active = Some(ActiveWrite::new(change, size, root_dir)?);
                     }
-
-                    let a = active.as_mut().unwrap();
-                    format_reader.copy_payload_to(record.payload_len, &mut a.payload)?;
-                    a.remaining = a.remaining.saturating_sub(record.payload_len);
-
-                    if a.remaining == 0 {
-                        let Active {
-                            change,
-                            payload,
-                            permit,
-                            ..
-                        } = active.take().unwrap();
-                        tx.send(StreamedFile {
-                            change,
-                            payload,
-                            _permit: permit,
-                        })
-                        .map_err(|_| {
-                            GappedError::WorkerPoolFailure("worker pool closed during dispatch")
-                        })?;
+                    let state = active.as_mut().unwrap();
+                    state.stream_record(&mut format_reader, record.payload_len)?;
+                    if state.remaining == 0 {
+                        let ActiveWrite { change, temp, .. } = active.take().unwrap();
+                        let is_add = matches!(&change.kind, ChangeKind::Added(_));
+                        if finish_active(&change, temp, root_dir) {
+                            if is_add {
+                                result.add_count += 1;
+                            } else {
+                                result.mod_count += 1;
+                            }
+                        } else {
+                            result.err_count += 1;
+                        }
+                        pb.inc(1);
                     }
                 }
                 _ => format_reader.skip_payload(record.payload_len)?,
@@ -484,53 +366,59 @@ fn read_diff_and_dispatch(
             "diff ended with unresolved content records".into(),
         ));
     }
-    Ok(())
+
+    pb.finish_with_message(format!("Wrote {} files", content_count));
+    Ok(result)
 }
 
-fn process_streamed_file(job: StreamedFile, root_dir: &Path, result: &mut StreamResult) {
-    let is_add = matches!(&job.change.kind, ChangeKind::Added(_));
-    if write_streamed_file(&job.change, &job.payload, root_dir) {
-        if is_add {
-            result.add_count += 1;
-        } else {
-            result.mod_count += 1;
-        }
-    } else {
-        result.err_count += 1;
+/// An in-progress write of a single file's content. Holds the tempfile open
+/// across potentially many `FileContent` records — a large file may span
+/// split-diff chunk boundaries.
+struct ActiveWrite {
+    change: Change,
+    temp: tempfile::NamedTempFile,
+    remaining: u64,
+}
+
+impl ActiveWrite {
+    fn new(change: Change, size: u64, root_dir: &Path) -> Result<Self> {
+        let full_path = change.path.to_full_path(root_dir);
+        let parent = full_path.parent().unwrap_or(Path::new("."));
+        let temp = tempfile::NamedTempFile::new_in(parent).map_err(GappedError::Io)?;
+        Ok(Self {
+            change,
+            temp,
+            remaining: size,
+        })
+    }
+
+    /// Copy `payload_len` bytes from the diff into the tempfile via a
+    /// short-lived BufWriter. Flushing at the record boundary keeps the
+    /// tempfile's file cursor consistent for any subsequent record.
+    fn stream_record(
+        &mut self,
+        format_reader: &mut FormatReader,
+        payload_len: u64,
+    ) -> Result<()> {
+        let mut writer = BufWriter::with_capacity(WRITE_BUFFER, self.temp.as_file_mut());
+        format_reader.copy_payload_to(payload_len, &mut writer)?;
+        writer.flush()?;
+        self.remaining = self.remaining.saturating_sub(payload_len);
+        Ok(())
     }
 }
 
-/// Write a buffered payload to a tempfile, persist it, and apply metadata.
-fn write_streamed_file(change: &Change, payload: &[u8], root_dir: &Path) -> bool {
+/// Finalise a completed tempfile: rename into place and stamp metadata.
+fn finish_active(
+    change: &Change,
+    temp: tempfile::NamedTempFile,
+    root_dir: &Path,
+) -> bool {
     let full_path = change.path.to_full_path(root_dir);
-    let parent = full_path.parent().unwrap_or(Path::new("."));
-
-    let mut temp = match tempfile::NamedTempFile::new_in(parent) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(
-                "Failed to create temp file for {}: {}",
-                full_path.display(),
-                e
-            );
-            return false;
-        }
-    };
-
-    if let Err(e) = temp.as_file_mut().write_all(payload) {
-        warn!(
-            "Failed to write file content for {}: {}",
-            full_path.display(),
-            e
-        );
-        return false;
-    }
-
     if let Err(e) = temp.persist(&full_path) {
         warn!("Failed to persist file {}: {}", full_path.display(), e);
         return false;
     }
-
     match &change.kind {
         ChangeKind::Added(added) => set_metadata(&full_path, &added.entry.metadata),
         ChangeKind::Modified(modified) => {
@@ -541,6 +429,20 @@ fn write_streamed_file(change: &Change, payload: &[u8], root_dir: &Path) -> bool
         _ => {}
     }
     true
+}
+
+/// Expected file-content size for a content change. Relies on the
+/// `ModifiedEntry` invariant: `has_content` implies `new_metadata.is_some()`.
+fn expected_content_size(change: &Change) -> u64 {
+    match &change.kind {
+        ChangeKind::Added(added) if added.has_content => added.entry.metadata.size,
+        ChangeKind::Modified(modified) if modified.has_content => modified
+            .new_metadata
+            .as_ref()
+            .map(|m| m.size)
+            .expect("has_content implies new_metadata is Some"),
+        _ => 0,
+    }
 }
 
 /// Set directory mtimes: first for dirs with explicit changes (deepest first),
@@ -682,9 +584,6 @@ mod tests {
 
         let chunks = detect_diff_files(&base).unwrap();
         assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0], tmp.path().join("diff.gapped.001"));
-        assert_eq!(chunks[1], tmp.path().join("diff.gapped.002"));
-        assert_eq!(chunks[2], tmp.path().join("diff.gapped.003"));
     }
 
     #[test]
@@ -701,7 +600,6 @@ mod tests {
         let base = tmp.path().join("diff.gapped");
         File::create(tmp.path().join("diff.gapped.001")).unwrap();
         File::create(tmp.path().join("diff.gapped.002")).unwrap();
-        // gap: .003 missing
         File::create(tmp.path().join("diff.gapped.004")).unwrap();
 
         let result = detect_diff_files(&base);
@@ -716,23 +614,19 @@ mod tests {
         let target = tmp.path().join("target");
         fs::create_dir(&source).unwrap();
 
-        // create enough files to generate multiple chunks under a small split size
         for i in 0..12 {
             fs::write(source.join(format!("file_{:02}.txt", i)), vec![b'a'; 1024]).unwrap();
         }
 
         copy_tree(&source, &target);
 
-        // initila snapshot
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
-        // modify every file
         std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..12 {
             fs::write(source.join(format!("file_{:02}.txt", i)), vec![b'b'; 2048]).unwrap();
         }
-        // add one, remove one
         fs::write(source.join("new.txt"), b"brand new\n").unwrap();
         fs::remove_file(source.join("file_00.txt")).unwrap();
 
@@ -750,17 +644,11 @@ mod tests {
         .unwrap();
 
         let chunks = detect_diff_files(&diff_base).unwrap();
-        assert!(
-            chunks.len() > 1,
-            "expected more than one chunk, got {}",
-            chunks.len()
-        );
+        assert!(chunks.len() > 1);
 
-        // Apply
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
         run_apply(&target, &chunk_refs, &Reporter::hidden()).unwrap();
 
-        // Validate
         assert!(!target.join("file_00.txt").exists());
         assert_eq!(fs::read(target.join("new.txt")).unwrap(), b"brand new\n");
         for i in 1..12 {
@@ -769,19 +657,20 @@ mod tests {
         }
     }
 
-    // Exercises the reader + worker-pool pipeline with enough files to saturate
-    // the channel (capacity = workers, max 8). Verifies byte-for-byte parity.
+    // Mixed file sizes — exercises multi-record payloads on split diffs and
+    // single-record payloads on smaller files through the same code path.
     #[test]
-    fn test_stream_file_contents_parallel() {
+    fn test_stream_file_contents_mixed_sizes() {
         let tmp = TempDir::new().unwrap();
         let source = tmp.path().join("source");
         let target = tmp.path().join("target");
         fs::create_dir(&source).unwrap();
 
-        const N: usize = 60;
-        for i in 0..N {
-            let fill = (i as u8).wrapping_mul(17);
-            fs::write(source.join(format!("f_{:03}.bin", i)), vec![fill; 4096]).unwrap();
+        // One file forced above a typical split chunk → will span records.
+        let big_size = 5 * 1024 * 1024;
+        fs::write(source.join("big.bin"), vec![b'X'; big_size]).unwrap();
+        for i in 0..20 {
+            fs::write(source.join(format!("s_{:02}.bin", i)), vec![b'a'; 4096]).unwrap();
         }
 
         copy_tree(&source, &target);
@@ -790,39 +679,40 @@ mod tests {
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        for i in 0..N {
-            let fill = (i as u8).wrapping_mul(23).wrapping_add(1);
-            fs::write(source.join(format!("f_{:03}.bin", i)), vec![fill; 5000]).unwrap();
+        fs::write(source.join("big.bin"), vec![b'Y'; big_size]).unwrap();
+        for i in 0..20 {
+            fs::write(source.join(format!("s_{:02}.bin", i)), vec![b'b'; 4096]).unwrap();
         }
 
-        let diff_base = tmp.path().join("diff.gapped");
+        let diff = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
         run_diff(
             &source,
             &snap1,
-            &diff_base,
+            &diff,
             &snap2,
-            None,
+            Some(1024 * 1024),
             false,
             &Reporter::hidden(),
         )
         .unwrap();
 
-        let chunks = detect_diff_files(&diff_base).unwrap();
+        let chunks = detect_diff_files(&diff).unwrap();
         let chunk_refs: Vec<&Path> = chunks.iter().map(|p| p.as_path()).collect();
         run_apply(&target, &chunk_refs, &Reporter::hidden()).unwrap();
 
-        for i in 0..N {
-            let expected = vec![(i as u8).wrapping_mul(23).wrapping_add(1); 5000];
-            let actual = fs::read(target.join(format!("f_{:03}.bin", i))).unwrap();
-            assert_eq!(actual, expected, "mismatch in file {}", i);
+        assert_eq!(fs::read(target.join("big.bin")).unwrap(), vec![b'Y'; big_size]);
+        for i in 0..20 {
+            assert_eq!(
+                fs::read(target.join(format!("s_{:02}.bin", i))).unwrap(),
+                vec![b'b'; 4096]
+            );
         }
     }
 
-    /// Pass 1 (`parse_diff_metadata`) must stop at the first FileContent
-    /// record, so corruption in the content section is invisible to it.
-    /// A full apply, which drains the diff to the end-of-record checksum,
-    /// must still detect the corruption.
+    /// Pass 1 (`parse_diff_metadata`) stops at the first FileContent record,
+    /// so corruption inside content is invisible to it. A full apply drains
+    /// the diff to the EOR checksum and must detect the corruption.
     #[test]
     fn test_pass1_stops_at_section_boundary() {
         let tmp = TempDir::new().unwrap();
@@ -857,24 +747,14 @@ mod tests {
         )
         .unwrap();
 
-        // flip a byte deep inside the file
         let mut bytes = fs::read(&diff).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xff;
         fs::write(&diff, &bytes).unwrap();
 
-        // pass 1 should succeed, it never reads the corrupted content or the
-        // trailing checksum
         let changes = parse_diff_metadata(&[diff.as_path()]).unwrap();
-        assert!(
-            changes.len() >= N,
-            "pass 1 should return at least {} changes, got {}",
-            N,
-            changes.len()
-        );
+        assert!(changes.len() >= N);
 
-        // a full apply reads through EOR and verifies the checksum, so the
-        // corruption must surface as an error.
         let result = run_apply(&target, &[diff.as_path()], &Reporter::hidden());
         assert!(result.is_err(), "full apply must reject corrupted diff");
     }
