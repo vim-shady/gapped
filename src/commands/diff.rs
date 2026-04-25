@@ -1,21 +1,21 @@
+use crate::commands::snapshot::SnapshotReader;
 use crate::error::{GappedError, Result};
-use crate::format::header::FileHeader;
+use crate::format::header::{FileHeader, RECORD_HEADER_SIZE};
 use crate::format::writer::FormatWriter;
+use crate::fs::walk::{WalkItem, WalkStats, WalkStream};
 use crate::model::diff::{AddedEntry, Change, ChangeKind, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
 use crate::parallel::{self, Chunk, ContentReader};
 use crate::progress::Reporter;
 use crossbeam_channel::{Receiver, Sender};
 use log::info;
+#[cfg(test)]
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-
-// FileContent record header: 8-byte length + 1-byte type tag
-const RECORD_HEADER: u64 = 9;
 
 pub fn run_diff(
     root_dir: &Path,
@@ -28,7 +28,6 @@ pub fn run_diff(
 ) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
 
-    // Compute hash of input snapshot
     info!("Hashing input snapshot {}", snapshot_in.display());
     let hash_pb = reporter.spinner("Hashing input snapshot");
     let source_snapshot_hash =
@@ -38,38 +37,30 @@ pub fn run_diff(
         })?;
     hash_pb.finish_and_clear();
 
-    // Load the input snapshot (sorted by path) so walk can binary-search it
-    // for hash reuse.
-    info!("Loading input snapshot {}", snapshot_in.display());
-    let load_pb = reporter.spinner("Loading input snapshot");
-    let (old_entries, _old_header) = crate::commands::snapshot::load_snapshot(snapshot_in)?;
-    load_pb.finish_with_message(format!("Loaded {} entries from input snapshot", old_entries.len()));
+    // streaming merge-join
+    info!("Opening input snapshot {}", snapshot_in.display());
+    let (prev_reader, _old_header) = SnapshotReader::open(snapshot_in)?;
 
-    // Walk current filesystem
+    let snap_file = File::create(snapshot_out)?;
+    let snap_buf = BufWriter::new(snap_file);
+    let snap_header = FileHeader::snapshot(&root_dir);
+    let mut snap_writer = FormatWriter::maybe_compressed(snap_buf, &snap_header, compress)?;
+    let snapshot_pb = reporter.spinner("Writing new snapshot");
+
     info!("Walking filesystem under {}", root_dir.display());
-    let (new_entries, stats) =
-        crate::fs::walk::walk_filesystem(&root_dir, Some(&old_entries), reporter)?;
+    let walk_stream = WalkStream::new(&root_dir, Some(prev_reader), reporter);
+    let result = compute_changes(walk_stream, &mut snap_writer)?;
 
-    // Compute diff
-    info!("Computing diff");
-    let compute_pb = reporter.spinner("Computing diff");
-    let changes = compute_diff(&old_entries, &new_entries, &root_dir)?;
-    compute_pb.finish_with_message(format!("Computed {} changes", changes.len()));
+    snap_writer.finish()?;
+    snapshot_pb.finish_with_message(format!(
+        "Wrote {} snapshot entries",
+        result.snapshot_entries
+    ));
 
-    let (mut added_count, mut modified_count, mut removed_count) = (0, 0, 0);
-    for change in &changes {
-        match &change.kind {
-            ChangeKind::Added(_) => added_count += 1,
-            ChangeKind::Modified(_) => modified_count += 1,
-            ChangeKind::Removed(_) => removed_count += 1,
-        }
-    }
-
-    // Write diff file(s)
     if let Some(max_bytes) = split_size {
         write_split_diff(
             diff_out,
-            &changes,
+            &result.changes,
             source_snapshot_hash,
             &root_dir,
             max_bytes,
@@ -79,7 +70,7 @@ pub fn run_diff(
     } else {
         write_single_diff(
             diff_out,
-            &changes,
+            &result.changes,
             source_snapshot_hash,
             &root_dir,
             compress,
@@ -87,47 +78,73 @@ pub fn run_diff(
         )?;
     }
 
-    // Write new snapshot
-    info!("Writing new snapshot to {}", snapshot_out.display());
-    write_snapshot(snapshot_out, &new_entries, &root_dir, compress, reporter)?;
-
-    // Report stats
     eprintln!("Diff complete:");
-    eprintln!("  Added: {}", added_count);
-    eprintln!("  Modified: {}", modified_count);
-    eprintln!("  Deleted: {}", removed_count);
-    eprintln!("  Total changes: {}", changes.len());
-    if stats.errors > 0 {
-        eprintln!("  Walk errors: {}", stats.errors);
+    eprintln!("  Added: {}", result.added);
+    eprintln!("  Modified: {}", result.modified);
+    eprintln!("  Deleted: {}", result.removed);
+    eprintln!("  Total changes: {}", result.changes.len());
+    if result.stats.errors > 0 {
+        eprintln!("  Walk errors: {}", result.stats.errors);
     }
 
     Ok(())
 }
 
-/// Write snapshot to file
-fn write_snapshot(
-    snapshot_out: &Path,
-    entries: &[Entry],
-    root_dir: &Path,
-    compress: bool,
-    reporter: &Reporter,
-) -> Result<()> {
-    let file = File::create(snapshot_out)?;
-    let buf_writer = BufWriter::new(file);
+struct DiffResult {
+    changes: Vec<Change>,
+    added: usize,
+    modified: usize,
+    removed: usize,
+    snapshot_entries: u64,
+    stats: WalkStats,
+}
 
-    let header = FileHeader::snapshot(root_dir);
+/// Consume a `WalkStream`, classify each item as a `Change`, and write new
+/// entries to the snapshot on the fly.
+fn compute_changes<W: Write>(
+    mut walk: WalkStream<'_>,
+    snap_writer: &mut FormatWriter<W>,
+) -> Result<DiffResult> {
+    let mut changes = Vec::new();
+    let (mut added, mut modified, mut removed) = (0, 0, 0);
+    let mut snapshot_entries: u64 = 0;
 
-    let mut writer = FormatWriter::maybe_compressed(buf_writer, &header, compress)?;
-
-    let pb = reporter.counter("Writing new snapshot", entries.len() as u64);
-    for entry in entries {
-        writer.write_snapshot_entry(entry)?;
-        pb.inc(1);
+    for item in walk.by_ref() {
+        match item? {
+            WalkItem::Added(new) => {
+                snap_writer.write_snapshot_entry(&new)?;
+                snapshot_entries += 1;
+                changes.push(build_added_change(&new));
+                added += 1;
+            }
+            WalkItem::Both { new, old } => {
+                snap_writer.write_snapshot_entry(&new)?;
+                snapshot_entries += 1;
+                if new.kind != old.kind {
+                    changes.push(build_removed_change(&old));
+                    changes.push(build_added_change(&new));
+                    removed += 1;
+                    added += 1;
+                } else if let Some(change) = compute_entry_diff(&old, &new) {
+                    changes.push(change);
+                    modified += 1;
+                }
+            }
+            WalkItem::Removed(old) => {
+                changes.push(build_removed_change(&old));
+                removed += 1;
+            }
+        }
     }
-    pb.finish_with_message(format!("Wrote {} entries", entries.len()));
 
-    writer.finish()?;
-    Ok(())
+    Ok(DiffResult {
+        changes,
+        added,
+        modified,
+        removed,
+        snapshot_entries,
+        stats: walk.into_stats(),
+    })
 }
 
 fn write_single_diff(
@@ -239,22 +256,22 @@ fn write_split_diff(
             }
         }
 
-        // Section 1 (DiffChange): batch as many as will fit in the chunk.
+        // section 1 (DiffChange): batch as many fir in the chunk
         while dc_cursor < changes.len() && writer.bytes_written() < max_bytes {
             writer.write_diff_change(&changes[dc_cursor])?;
             dc_cursor += 1;
             meta_pb.inc(1);
         }
 
-        // Section 2 (FileContent): emit content for committed changes in
+        // section 2 (FileContent): emit content for committed changes in
         // [fc_cursor, dc_cursor). Stop when the chunk fills; the straddled
-        // file, if any, is carried over in 'partial'.
+        // file - if any - is carried over in 'partial'.
         while fc_cursor < dc_cursor {
             if !changes[fc_cursor].has_content() {
                 fc_cursor += 1;
                 continue;
             }
-            if writer.bytes_written() + RECORD_HEADER >= max_bytes {
+            if writer.bytes_written() + RECORD_HEADER_SIZE >= max_bytes {
                 break; // no room even for an empty FC record — roll chunk.
             }
 
@@ -315,7 +332,7 @@ fn write_content_fragment<W: Write>(
     reader: &mut ContentReader,
     max_bytes: u64,
 ) -> Result<()> {
-    let budget = max_bytes.saturating_sub(writer.bytes_written() + RECORD_HEADER);
+    let budget = max_bytes.saturating_sub(writer.bytes_written() + RECORD_HEADER_SIZE);
     let remaining = reader.remaining();
     let fragment = remaining.min(if budget > 0 { budget } else { remaining });
     writer.write_file_content_from_reader(reader, fragment)?;
@@ -488,52 +505,6 @@ fn stream_file(job: ReadJob) {
     }
 }
 
-fn compute_diff(
-    old_entries: &[Entry],
-    new_entries: &[Entry],
-    _root_dir: &Path,
-) -> Result<Vec<Change>> {
-    let mut diff = Vec::new();
-    let mut old_iter = old_entries.iter().peekable();
-    let mut new_iter = new_entries.iter().peekable();
-
-    loop {
-        match (old_iter.peek(), new_iter.peek()) {
-            (Some(old), Some(new)) => match old.path.cmp(&new.path) {
-                Ordering::Less => {
-                    diff.push(build_removed_change(old));
-                    old_iter.next();
-                }
-                Ordering::Greater => {
-                    diff.push(build_added_change(new));
-                    new_iter.next();
-                }
-                Ordering::Equal => {
-                    if old.kind != new.kind {
-                        diff.push(build_removed_change(old));
-                        diff.push(build_added_change(new));
-                    } else if let Some(change) = compute_entry_diff(old, new) {
-                        diff.push(change);
-                    }
-                    old_iter.next();
-                    new_iter.next();
-                }
-            },
-            (Some(old), None) => {
-                diff.push(build_removed_change(old));
-                old_iter.next();
-            }
-            (None, Some(new)) => {
-                diff.push(build_added_change(new));
-                new_iter.next();
-            }
-            (None, None) => break,
-        }
-    }
-
-    Ok(diff)
-}
-
 /// Compare two entire of the same kind and produce a change if they differ
 fn compute_entry_diff(old: &Entry, new: &Entry) -> Option<Change> {
     debug_assert!(old.kind == new.kind);
@@ -585,6 +556,56 @@ fn build_added_change(entry: &Entry) -> Change {
             has_content: entry.kind == EntryKind::File,
         }),
     }
+}
+
+/// Reference merge-join used only by the unit tests. this function exists to keep the
+/// test suite able to exercise the merge logic on small
+/// snapshots without needing a real filesystem walk.
+#[cfg(test)]
+fn compute_diff(
+    old_entries: &[Entry],
+    new_entries: &[Entry],
+    _root_dir: &Path,
+) -> Result<Vec<Change>> {
+    let mut diff = Vec::new();
+    let mut old_iter = old_entries.iter().peekable();
+    let mut new_iter = new_entries.iter().peekable();
+
+    loop {
+        match (old_iter.peek(), new_iter.peek()) {
+            (Some(old), Some(new)) => match old.path.cmp(&new.path) {
+                Ordering::Less => {
+                    diff.push(build_removed_change(old));
+                    old_iter.next();
+                }
+                Ordering::Greater => {
+                    diff.push(build_added_change(new));
+                    new_iter.next();
+                }
+                Ordering::Equal => {
+                    if old.kind != new.kind {
+                        diff.push(build_removed_change(old));
+                        diff.push(build_added_change(new));
+                    } else if let Some(change) = compute_entry_diff(old, new) {
+                        diff.push(change);
+                    }
+                    old_iter.next();
+                    new_iter.next();
+                }
+            },
+            (Some(old), None) => {
+                diff.push(build_removed_change(old));
+                old_iter.next();
+            }
+            (None, Some(new)) => {
+                diff.push(build_added_change(new));
+                new_iter.next();
+            }
+            (None, None) => break,
+        }
+    }
+
+    Ok(diff)
 }
 
 #[cfg(test)]
@@ -1060,7 +1081,16 @@ mod tests {
 
         let diff = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
-        run_diff(&source, &snap1, &diff, &snap2, None, false, &Reporter::hidden()).unwrap();
+        run_diff(
+            &source,
+            &snap1,
+            &diff,
+            &snap2,
+            None,
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
 
         assert!(diff.exists(), "single diff file should be written");
         assert!(

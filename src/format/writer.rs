@@ -1,9 +1,11 @@
 use crate::error::{GappedError, Result};
-use crate::format::header::{EOR, FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
+use crate::format::header::{FileHeader, RecordType, EOR, MAGIC, MAGIC_COMPRESSED};
 use crate::model::diff::Change;
 use crate::model::entry::Entry;
 use std::io::{self, Read, Write};
 use xxhash_rust::xxh3::Xxh3;
+
+const STREAM_BUF: usize = 64 * 1024;
 
 /// Streaming writer for gapped file format
 /// Writes records one at a time, computing a checksum for everything written
@@ -105,7 +107,7 @@ impl<W: Write> FormatWriter<W> {
         self.hasher.update(&type_byte);
         self.bytes_written += 9;
 
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = [0u8; STREAM_BUF];
         let mut remaining = size;
         while remaining > 0 {
             let want = (remaining as usize).min(buf.len());

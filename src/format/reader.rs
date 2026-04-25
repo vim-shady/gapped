@@ -1,7 +1,12 @@
 use crate::error::{GappedError, Result};
-use crate::format::header::{FileHeader, MAGIC, MAGIC_COMPRESSED, RecordType};
+use crate::format::header::{
+    FileHeader, RecordType, CHECKSUM_LEN, MAGIC, MAGIC_COMPRESSED, MAGIC_LEN, RECORD_LEN_SIZE,
+    RECORD_TYPE_SIZE,
+};
 use std::io::{BufReader, Read, Write};
 use xxhash_rust::xxh3::Xxh3;
+
+const STREAM_BUF: usize = 64 * 1024;
 
 /// Header of a record
 pub struct RecordHeader {
@@ -21,7 +26,7 @@ impl FormatReader {
         let mut hasher = Xxh3::new();
 
         // Read magic bytes
-        let mut magic = [0u8; 9];
+        let mut magic = [0u8; MAGIC_LEN];
         inner.read_exact(&mut magic)?;
         hasher.update(&magic);
 
@@ -67,7 +72,7 @@ impl FormatReader {
         ))
     }
 
-    /// Read the next record header. Returns `None` at end-of-records (EOR).
+    /// Read the next record header. Returns `None` at EOR.
     /// After calling this, one must consume the payload via `read_payload`,
     /// `skip_payload`, or `copy_payload_to` before calling this again.
     pub fn next_record_header(&mut self) -> Result<Option<RecordHeader>> {
@@ -76,18 +81,18 @@ impl FormatReader {
         }
 
         // Read record length + type byte
-        let mut len_bytes = [0u8; 8];
+        let mut len_bytes = [0u8; RECORD_LEN_SIZE];
         self.inner.read_exact(&mut len_bytes)?;
-        let mut type_byte = [0u8; 1];
+        let mut type_byte = [0u8; RECORD_TYPE_SIZE];
         self.inner.read_exact(&mut type_byte)?;
 
         // Check for EOR
-        if len_bytes == [0u8; 8] && type_byte[0] == 0 {
+        if len_bytes == [0u8; RECORD_LEN_SIZE] && type_byte[0] == 0 {
             self.hasher.update(&len_bytes);
             self.hasher.update(&type_byte);
 
             // Read and verify checksum
-            let mut checksum_bytes = [0u8; 16];
+            let mut checksum_bytes = [0u8; CHECKSUM_LEN];
             self.inner.read_exact(&mut checksum_bytes)?;
 
             let expected_hash = self.hasher.digest128().to_le_bytes();
@@ -130,7 +135,8 @@ impl FormatReader {
 
     /// Stream a payload to a writer without materializing it and update the hasher.
     pub fn copy_payload_to<W: Write>(&mut self, len: u64, dest: &mut W) -> Result<()> {
-        let mut buf = [0u8; 64 * 1024];
+        // 64 KiB: stack-allocated, fits in L1 data cache
+        let mut buf = [0u8; STREAM_BUF];
         let mut remaining = len;
         while remaining > 0 {
             let to_read = (remaining as usize).min(buf.len());

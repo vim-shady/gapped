@@ -11,17 +11,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::{File, Permissions};
 use std::io::{BufReader, BufWriter, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Read-ahead on the diff file. A 1 MiB buffer keeps the kernel read queue
-/// deep without inflating working set — apply is single-threaded so there's
-/// no benefit to going bigger.
-const DIFF_READ_BUFFER: usize = 1024 * 1024;
-
-/// Write-side buffer for streaming a file payload to its tempfile. Large
-/// enough to coalesce record-sized reads into one sequential write per flush.
-const WRITE_BUFFER: usize = 1024 * 1024;
+const READ_BUF: usize = 1024 * 1024;
+const WRITE_BUF: usize = 1024 * 1024;
 
 struct ApplyResult {
     add_count: usize,
@@ -92,7 +86,7 @@ pub fn parse_diff_metadata(diff_files: &[&Path]) -> Result<Vec<Change>> {
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
-        let reader = BufReader::with_capacity(DIFF_READ_BUFFER, file);
+        let reader = BufReader::with_capacity(READ_BUF, file);
         let (mut format_reader, header) = FormatReader::new(reader)?;
         check_diff_version(&header)?;
 
@@ -294,13 +288,8 @@ fn apply_non_content_changes(
 /// `FileContent` record, stream bytes straight into the target's tempfile
 /// via a per-record `BufWriter`. When all expected bytes for a change have
 /// been written, persist the tempfile and apply metadata. Per-file memory
-/// is bounded by `WRITE_BUFFER`; a single file can span multiple records
+/// is bounded by `WRITE_BUF`. A single file can span multiple records
 /// (and diff-chunk boundaries) — the tempfile stays open across them.
-///
-/// An earlier parallel dispatcher was removed after benchmarking showed
-/// ext4 serialises per-file `rename()` + journal commits regardless of
-/// thread count; the extra machinery added complexity with no measurable
-/// wall-clock benefit.
 fn stream_file_contents(
     diff_files: &[&Path],
     root_dir: &Path,
@@ -316,7 +305,7 @@ fn stream_file_contents(
 
     for diff_path in diff_files {
         let file = File::open(diff_path)?;
-        let reader = BufReader::with_capacity(DIFF_READ_BUFFER, file);
+        let reader = BufReader::with_capacity(READ_BUF, file);
         let (mut format_reader, header) = FormatReader::new(reader)?;
         check_diff_version(&header)?;
 
@@ -400,7 +389,7 @@ impl ActiveWrite {
         format_reader: &mut FormatReader,
         payload_len: u64,
     ) -> Result<()> {
-        let mut writer = BufWriter::with_capacity(WRITE_BUFFER, self.temp.as_file_mut());
+        let mut writer = BufWriter::with_capacity(WRITE_BUF, self.temp.as_file_mut());
         format_reader.copy_payload_to(payload_len, &mut writer)?;
         writer.flush()?;
         self.remaining = self.remaining.saturating_sub(payload_len);

@@ -12,37 +12,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-/// Load a snapshot from a file (should already be sorted by path)
-pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
-    let file = File::open(snapshot_path)?;
-    let reader = std::io::BufReader::new(file);
-    let (mut format_reader, header) = FormatReader::new(reader)?;
-
-    let mut entries = Vec::new();
-    while let Some(h) = format_reader.next_record_header()? {
-        if h.record_type == RecordType::SnapshotEntry {
-            let payload = format_reader.read_payload(h.payload_len)?;
-            let entry: Entry = rmp_serde::from_slice(&payload)?;
-            entries.push(entry);
-        } else {
-            format_reader.skip_payload(h.payload_len)?;
-        }
-    }
-
-    Ok((entries, header))
-}
-
-/// Load a snapshot from a file, returning the entries as a HashMap for O(1) lookup
-pub fn load_snapshot_entries(
-    snapshot_path: &Path,
-) -> Result<(HashMap<RelativePath, Entry>, FileHeader)> {
-    let (entries, header) = load_snapshot(snapshot_path)?;
-    let map = entries
-        .into_iter()
-        .map(|e| (e.path.clone(), e))
-        .collect();
-    Ok((map, header))
-}
+const READ_BUF: usize = 1024 * 1024;
 
 pub fn run_snapshot(
     root_dir: &Path,
@@ -59,7 +29,10 @@ pub fn run_snapshot(
         info!("Loading previous snapshot from {}", snapshot_in.display());
         let load_pb = reporter.spinner("Loading snapshot");
         let (entries, _header) = load_snapshot(snapshot_in)?;
-        load_pb.finish_with_message(format!("Loaded {} entries from previous snapshot", entries.len()));
+        load_pb.finish_with_message(format!(
+            "Loaded {} entries from previous snapshot",
+            entries.len()
+        ));
         Some(entries)
     } else {
         None
@@ -96,4 +69,75 @@ pub fn run_snapshot(
     }
 
     Ok(())
+}
+
+/// Streaming iterator over snapshot entries.
+///
+/// Reads one entry at a time from a snapshot file without materialising the
+/// whole list. Snapshots are written in path-sorted order, so iteration
+/// order matches that sort
+pub struct SnapshotReader {
+    format_reader: FormatReader,
+    finished: bool,
+}
+
+impl SnapshotReader {
+    pub fn open(path: &Path) -> Result<(Self, FileHeader)> {
+        let file = File::open(path)?;
+        let reader = std::io::BufReader::with_capacity(READ_BUF, file);
+        let (format_reader, header) = FormatReader::new(reader)?;
+        Ok((
+            Self {
+                format_reader,
+                finished: false,
+            },
+            header,
+        ))
+    }
+
+    /// Read the next entry. Non-entry records are skipped automatically.
+    /// Returns `Ok(None)` at EOR.
+    pub fn next_entry(&mut self) -> Result<Option<Entry>> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            match self.format_reader.next_record_header()? {
+                None => {
+                    self.finished = true;
+                    return Ok(None);
+                }
+                Some(h) if h.record_type == RecordType::SnapshotEntry => {
+                    let payload = self.format_reader.read_payload(h.payload_len)?;
+                    let entry: Entry = rmp_serde::from_slice(&payload)?;
+                    return Ok(Some(entry));
+                }
+                Some(h) => self.format_reader.skip_payload(h.payload_len)?,
+            }
+        }
+    }
+}
+
+/// Load a snapshot from a file (should already be sorted by path).
+///
+/// Convenience wrapper around [`SnapshotReader`] for callers that legitimately
+/// need the whole list (tests, the current verify path). New code that does
+/// streaming comparison should use `SnapshotReader` directly to keep memory
+/// bounded.
+pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
+    let (mut reader, header) = SnapshotReader::open(snapshot_path)?;
+    let mut entries = Vec::new();
+    while let Some(entry) = reader.next_entry()? {
+        entries.push(entry);
+    }
+    Ok((entries, header))
+}
+
+/// Load a snapshot from a file, returning the entries as a HashMap for O(1) lookup
+pub fn load_snapshot_entries(
+    snapshot_path: &Path,
+) -> Result<(HashMap<RelativePath, Entry>, FileHeader)> {
+    let (entries, header) = load_snapshot(snapshot_path)?;
+    let map = entries.into_iter().map(|e| (e.path.clone(), e)).collect();
+    Ok((map, header))
 }

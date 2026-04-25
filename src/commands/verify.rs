@@ -203,7 +203,7 @@ mod tests {
     /// must mirror that and stay quiet.
     #[test]
     fn test_run_verify_skips_implicit_parent_dir_mtime_drift() {
-        use nix::sys::stat::{UtimensatFlags, utimensat};
+        use nix::sys::stat::{utimensat, UtimensatFlags};
         use nix::sys::time::TimeSpec;
 
         let tmp = TempDir::new().unwrap();

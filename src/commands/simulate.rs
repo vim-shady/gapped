@@ -29,7 +29,7 @@ pub fn simulate_apply(
                 explicit_dirs.insert(change.path.clone());
             }
             ChangeKind::Modified(modified) if modified.new_metadata.is_some() => {
-                // Apply checks the live filesystem; here we use the in-memory
+                // apply checks the live filesystem. here we use the in-memory
                 // state, which `verify` populates from a fresh walk.
                 if state
                     .get(&change.path)

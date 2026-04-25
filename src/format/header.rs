@@ -6,11 +6,25 @@ use std::path::Path;
 /// Magic bytes identifying a gapped file
 pub const MAGIC: &[u8; 9] = b"GAPPED\x00\x03\x00";
 
+pub const MAGIC_LEN: usize = 9;
+
 /// Magic bytes for identifying a zstd-compressed gapped file
 pub const MAGIC_COMPRESSED: &[u8; 9] = b"GAPPEDZ03";
 
-/// End of record marker
-pub const EOR: [u8; 9] = [0u8; 9];
+/// Size of the record-length field (u64 LE)
+pub const RECORD_LEN_SIZE: usize = 8;
+
+/// Size of the record-type field
+pub const RECORD_TYPE_SIZE: usize = 1;
+
+/// Combined record header: length field + type byte
+pub const RECORD_HEADER_SIZE: u64 = RECORD_LEN_SIZE as u64 + RECORD_TYPE_SIZE as u64;
+
+/// Length of XXH3-128 checksum in bytes
+pub const CHECKSUM_LEN: usize = 16;
+
+/// End-of-records marker (one zero-length record header)
+pub const EOR: [u8; RECORD_LEN_SIZE + RECORD_TYPE_SIZE] = [0u8; RECORD_LEN_SIZE + RECORD_TYPE_SIZE];
 
 /// Record types in binary format
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -5,18 +5,23 @@ use std::thread;
 
 use crate::error::{GappedError, Result};
 
+/// Bytes per chunk sent through a prefetch channel
 pub const CHUNK_SIZE: usize = 256 * 1024;
+
+/// Bounded-channel depth per file.
 pub const CHUNK_DEPTH: usize = 4;
 
 pub type Chunk = io::Result<Vec<u8>>;
 
-/// Best-effort worker count: available cores, capped to 8. Used by the diff
-/// prefetch pool and the walk hasher.
+const DEFAULT_WORKERS: usize = 4;
+const MAX_WORKERS: usize = 8;
+
+/// Best-effort worker count: available cores, capped to [`MAX_WORKERS`].
 pub fn worker_count() -> usize {
     thread::available_parallelism()
         .map(NonZeroUsize::get)
-        .unwrap_or(4)
-        .min(8)
+        .unwrap_or(DEFAULT_WORKERS)
+        .min(MAX_WORKERS)
 }
 
 /// Create a bounded chunk channel with pipelines standard depth.
