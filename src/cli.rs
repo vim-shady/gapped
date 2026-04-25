@@ -43,8 +43,8 @@ pub enum Commands {
         /// Output snapshot file (current state)
         snapshot_out: PathBuf,
 
-        /// Split size for diff
-        #[arg(long)]
+        /// Max bytes per diff chunk (e.g. 100MB, 500KB, 2GB, or raw bytes)
+        #[arg(long, value_parser = parse_byte_size)]
         split_size: Option<u64>,
 
         /// Compress the output
@@ -71,5 +71,30 @@ pub enum Commands {
 
         /// Target snapshot file
         snapshot_file: PathBuf,
-    }
+    },
+}
+
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (digits, suffix) = match s.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(pos) => (&s[..pos], s[pos..].to_ascii_uppercase()),
+        None => return s.parse::<u64>().map_err(|e| e.to_string()),
+    };
+    let base: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let multiplier = match suffix.as_str() {
+        "B" => 1,
+        "K" | "KB" => 1024,
+        "M" | "MB" => 1024 * 1024,
+        "G" | "GB" => 1024 * 1024 * 1024,
+        other => {
+            return Err(format!(
+                "unknown size suffix '{other}'; use B, KB, MB, or GB"
+            ));
+        }
+    };
+    base.checked_mul(multiplier)
+        .ok_or_else(|| format!("{base}{suffix} overflows u64"))
 }
