@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Sweep driver: generate synthetic trees at multiple scales and run the
 # bench harness against each. Appends all results to one CSV.
 # Generated trees are persisted on disk (for reuse).

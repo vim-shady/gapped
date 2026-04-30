@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Plot benchmark results produced by run_bench.sh / experiment.sh.
 

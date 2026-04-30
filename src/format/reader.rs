@@ -1,7 +1,7 @@
 use crate::error::{GappedError, Result};
 use crate::format::header::{
-    FileHeader, RecordType, CHECKSUM_LEN, MAGIC, MAGIC_COMPRESSED, MAGIC_LEN, RECORD_LEN_SIZE,
-    RECORD_TYPE_SIZE,
+    CHECKSUM_LEN, FileHeader, MAGIC, MAGIC_COMPRESSED, MAGIC_LEN, RECORD_LEN_SIZE,
+    RECORD_TYPE_SIZE, RecordType,
 };
 use std::io::{BufReader, Read, Write};
 use xxhash_rust::xxh3::Xxh3;
@@ -135,7 +135,7 @@ impl FormatReader {
 
     /// Stream a payload to a writer without materializing it and update the hasher.
     pub fn copy_payload_to<W: Write>(&mut self, len: u64, dest: &mut W) -> Result<()> {
-        // 64 KiB: stack-allocated, fits in L1 data cache
+        // 64 KiB: stack-allocated
         let mut buf = [0u8; STREAM_BUF];
         let mut remaining = len;
         while remaining > 0 {

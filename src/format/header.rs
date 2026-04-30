@@ -6,10 +6,10 @@ use std::path::Path;
 /// Magic bytes identifying a gapped file
 pub const MAGIC: &[u8; 9] = b"GAPPED\x00\x03\x00";
 
-pub const MAGIC_LEN: usize = 9;
-
 /// Magic bytes for identifying a zstd-compressed gapped file
 pub const MAGIC_COMPRESSED: &[u8; 9] = b"GAPPEDZ03";
+
+pub const MAGIC_LEN: usize = 9;
 
 /// Size of the record-length field (u64 LE)
 pub const RECORD_LEN_SIZE: usize = 8;

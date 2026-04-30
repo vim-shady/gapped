@@ -236,7 +236,7 @@ fn write_split_diff(
     loop {
         // Drain any content carried from the previous chunk first. While a
         // file is straddling, no new DiffChanges may be introduced in this
-        // chunk — the position-based pairing would break.
+        // chunk
         if let Some(reader) = partial.as_mut() {
             write_content_fragment(&mut writer, reader, max_bytes)?;
             if reader.remaining() == 0 {
@@ -256,7 +256,7 @@ fn write_split_diff(
             }
         }
 
-        // section 1 (DiffChange): batch as many fir in the chunk
+        // section 1 (DiffChange): batch as many fit in the chunk
         while dc_cursor < changes.len() && writer.bytes_written() < max_bytes {
             writer.write_diff_change(&changes[dc_cursor])?;
             dc_cursor += 1;
@@ -505,7 +505,7 @@ fn stream_file(job: ReadJob) {
     }
 }
 
-/// Compare two entire of the same kind and produce a change if they differ
+/// Compare two entries of the same kind and produce a change if they differ
 fn compute_entry_diff(old: &Entry, new: &Entry) -> Option<Change> {
     debug_assert!(old.kind == new.kind);
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Run gapped through all four phases against
 # a given source tree, capturing per-phase time/memory metrics via
 # /usr/bin/time -v. Appends one CSV row per phase to $RESULTS

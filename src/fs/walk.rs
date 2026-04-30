@@ -22,6 +22,89 @@ pub struct WalkStats {
     pub files_hash_reused: usize,
     pub errors: usize,
 }
+
+impl WalkStats {
+    fn count(&mut self, kind: EntryKind) {
+        match kind {
+            EntryKind::File => self.files += 1,
+            EntryKind::Directory => self.directories += 1,
+            EntryKind::Symlink => self.symlinks += 1,
+        }
+        self.total_entries += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+enum ClassifyError {
+    Failed,
+    Skip,
+}
+
+/// Resolve a walkdir entry into its relative path, kind, metadata, and
+/// optional symlink target. Returns `Err(Failed)` for I/O errors (already
+/// logged) and `Err(Skip)` for unsupported file types (sockets, pipes, …).
+fn classify_dir_entry(
+    dir_entry: &walkdir::DirEntry,
+    root: &Path,
+) -> std::result::Result<(RelativePath, EntryKind, Metadata, Option<PathBuf>), ClassifyError> {
+    let full_path = dir_entry.path();
+
+    let rel_path = if full_path == root {
+        RelativePath::root()
+    } else {
+        RelativePath::from_full_path(full_path, root).map_err(|e| {
+            warn!("Error while walking filesystem: {}", e);
+            ClassifyError::Failed
+        })?
+    };
+
+    let (metadata, file_type) = collect_metadata(full_path).map_err(|e| {
+        warn!("Cannot read metadata for {}: {}", full_path.display(), e);
+        ClassifyError::Failed
+    })?;
+
+    if file_type.is_file() {
+        Ok((rel_path, EntryKind::File, metadata, None))
+    } else if file_type.is_dir() {
+        Ok((rel_path, EntryKind::Directory, metadata, None))
+    } else if file_type.is_symlink() {
+        let target = std::fs::read_link(full_path).map_err(|e| {
+            warn!("Cannot read symlink {}: {}", full_path.display(), e);
+            ClassifyError::Failed
+        })?;
+        Ok((rel_path, EntryKind::Symlink, metadata, Some(target)))
+    } else {
+        warn!("Skipping special file {}", full_path.display());
+        Err(ClassifyError::Skip)
+    }
+}
+
+/// Try to reuse a content hash from `old_entry`, falling back to hashing
+/// the file on disk. Returns `(hash, reused)`.
+fn resolve_file_hash(
+    rel_path: &RelativePath,
+    metadata: &Metadata,
+    old_entry: Option<&Entry>,
+    root: &Path,
+) -> std::io::Result<([u8; 16], bool)> {
+    if let Some(old) = old_entry {
+        if old.kind == EntryKind::File && old.metadata.size_and_mtime_match(metadata) {
+            if let Some(h) = old.hash {
+                return Ok((h, true));
+            }
+        }
+    }
+    let full_path = rel_path.to_full_path(root);
+    hash_file(&full_path).map(|h| (h, false))
+}
+
+// ---------------------------------------------------------------------------
+// Classic (non-streaming) walk
+// ---------------------------------------------------------------------------
+
 /// Walk the filesystem under 'root' and return a sorted list of entries.
 ///
 /// `previous_entries` must be sorted by path (the invariant held by snapshots
@@ -33,89 +116,36 @@ pub fn walk_filesystem(
     reporter: &Reporter,
 ) -> Result<(Vec<Entry>, WalkStats)> {
     let mut stats = WalkStats::default();
-
     let mut raw_entries = Vec::new();
 
     let walk_pb = reporter.spinner("Walking filesystem");
-    for dir_entry_result in WalkDir::new(root).follow_links(false) {
-        let dir_entry = match dir_entry_result {
-            Ok(dir_entry) => dir_entry,
+    for result in WalkDir::new(root).follow_links(false) {
+        let dir_entry = match result {
+            Ok(e) => e,
             Err(e) => {
                 warn!("Error while walking filesystem: {}", e);
                 stats.errors += 1;
                 continue;
             }
         };
-
-        let full_path = dir_entry.path();
-
-        let relative_path = if full_path == root {
-            RelativePath::root()
-        } else {
-            match RelativePath::from_full_path(full_path, root) {
-                Ok(relative_path) => relative_path,
-                Err(e) => {
-                    warn!("Error while walking filesystem: {}", e);
-                    stats.errors += 1;
-                    continue;
-                }
+        match classify_dir_entry(&dir_entry, root) {
+            Ok(classified) => {
+                stats.count(classified.1);
+                walk_pb.inc(1);
+                raw_entries.push(classified);
             }
-        };
-
-        let (metadata, file_type) = match collect_metadata(full_path) {
-            Ok(metadata) => metadata,
-            Err(e) => {
-                warn!("Cannot read metadata for {}: {}", full_path.display(), e);
-                stats.errors += 1;
-                continue;
-            }
-        };
-
-        let kind: EntryKind;
-        let mut symlink_target = None;
-
-        if file_type.is_file() {
-            kind = EntryKind::File;
-            stats.files += 1;
-        } else if file_type.is_dir() {
-            kind = EntryKind::Directory;
-            stats.directories += 1;
-        } else if file_type.is_symlink() {
-            kind = EntryKind::Symlink;
-            stats.symlinks += 1;
-            match std::fs::read_link(full_path) {
-                Ok(target) => symlink_target = Some(target),
-                Err(e) => {
-                    warn!("Cannot read symlink {}: {}", full_path.display(), e);
-                    stats.errors += 1;
-                    continue;
-                }
-            }
-        } else {
-            // skip special files (sockets, pipes, ...)
-            warn!("Skipping special file {}", full_path.display());
-            continue;
+            Err(ClassifyError::Failed) => stats.errors += 1,
+            Err(ClassifyError::Skip) => {}
         }
-        stats.total_entries += 1;
-        walk_pb.inc(1);
-        raw_entries.push((relative_path, kind, metadata, symlink_target));
     }
     walk_pb.finish_with_message(format!("Walked {} entries", stats.total_entries));
 
-    // Compute hashes for files in parallel, tracking hash outcome for stats
-    #[derive(Clone, Copy)]
-    enum HashOutcome {
-        Hashed,
-        Reused,
-        NotAFile,
-        Error,
-    }
-
+    // Hash files in parallel, reusing old hashes where possible.
     let hash_pb = reporter.counter("Hashing files", stats.files as u64);
-    let root_owned = root.to_path_buf();
-    let results: Vec<(Option<Entry>, HashOutcome)> = raw_entries
+    let root_buf = root.to_path_buf();
+    let results: Vec<(Option<Entry>, bool)> = raw_entries
         .par_iter()
-        .map(|(rel_path, kind, metadata, link_target)| {
+        .map(|(rel_path, kind, metadata, symlink_target)| {
             if *kind != EntryKind::File {
                 return (
                     Some(Entry {
@@ -123,49 +153,30 @@ pub fn walk_filesystem(
                         kind: *kind,
                         metadata: metadata.clone(),
                         hash: None,
-                        symlink_target: link_target.clone(),
+                        symlink_target: symlink_target.clone(),
                     }),
-                    HashOutcome::NotAFile,
+                    false,
                 );
             }
-
-            // Check if we can reuse an old hash
-            if let Some(prev) = previous_entries
-                && let Ok(idx) = prev.binary_search_by(|e| e.path.cmp(rel_path))
-            {
-                let prev_entry = &prev[idx];
-                if prev_entry.kind == EntryKind::File
-                    && prev_entry.metadata.size_and_mtime_match(metadata)
-                {
-                    hash_pb.inc(1);
-                    return (
-                        Some(Entry {
-                            path: rel_path.clone(),
-                            kind: *kind,
-                            metadata: metadata.clone(),
-                            hash: prev_entry.hash,
-                            symlink_target: None,
-                        }),
-                        HashOutcome::Reused,
-                    );
-                }
-            }
-
-            let full_path = rel_path.to_full_path(&root_owned);
-            let out = match hash_file(&full_path) {
-                Ok(hash) => (
+            let old = previous_entries.and_then(|prev| {
+                prev.binary_search_by(|e| e.path.cmp(rel_path))
+                    .ok()
+                    .map(|i| &prev[i])
+            });
+            let out = match resolve_file_hash(rel_path, metadata, old, &root_buf) {
+                Ok((h, reused)) => (
                     Some(Entry {
                         path: rel_path.clone(),
                         kind: *kind,
                         metadata: metadata.clone(),
-                        hash: Some(hash),
-                        symlink_target: link_target.clone(),
+                        hash: Some(h),
+                        symlink_target: symlink_target.clone(),
                     }),
-                    HashOutcome::Hashed,
+                    reused,
                 ),
                 Err(e) => {
-                    warn!("Cannot hash {}: {}", full_path.display(), e);
-                    (None, HashOutcome::Error)
+                    warn!("Cannot hash {}: {}", rel_path, e);
+                    (None, false)
                 }
             };
             hash_pb.inc(1);
@@ -173,22 +184,24 @@ pub fn walk_filesystem(
         })
         .collect();
 
-    // Collect results and stats in a single pass
-    let mut result_entries: Vec<Entry> = Vec::with_capacity(results.len());
-    for (opt_entry, outcome) in results {
-        match outcome {
-            HashOutcome::Hashed => stats.files_hashed += 1,
-            HashOutcome::Reused => stats.files_hash_reused += 1,
-            HashOutcome::Error => stats.errors += 1,
-            HashOutcome::NotAFile => {}
-        }
-        if let Some(entry) = opt_entry {
-            result_entries.push(entry);
+    let mut entries = Vec::with_capacity(results.len());
+    for (opt_entry, reused) in results {
+        match opt_entry {
+            Some(entry) => {
+                if entry.kind == EntryKind::File {
+                    if reused {
+                        stats.files_hash_reused += 1;
+                    } else {
+                        stats.files_hashed += 1;
+                    }
+                }
+                entries.push(entry);
+            }
+            None => stats.errors += 1,
         }
     }
 
-    // Sort by path
-    result_entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
 
     info!(
         "Walk complete: {} entries ({} files, {} dirs, {} symlinks), {} hashed, {} reused, {} errors",
@@ -201,8 +214,12 @@ pub fn walk_filesystem(
         stats.errors
     );
 
-    Ok((result_entries, stats))
+    Ok((entries, stats))
 }
+
+// ---------------------------------------------------------------------------
+// Streaming walk
+// ---------------------------------------------------------------------------
 
 /// Entries per rayon batch in the streaming walk. With the 8-thread worker
 /// cap, 512 = 8 threads × 64 items/thread — enough to amortize rayon's
@@ -326,52 +343,18 @@ impl<'a> WalkStream<'a> {
                     continue;
                 }
             };
-            let full_path = dir_entry.path();
 
-            let rel_path = if full_path == self.root {
-                RelativePath::root()
-            } else {
-                match RelativePath::from_full_path(full_path, &self.root) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("Error while walking filesystem: {}", e);
+            let (rel_path, kind, metadata, symlink_target) =
+                match classify_dir_entry(&dir_entry, &self.root) {
+                    Ok(classified) => classified,
+                    Err(ClassifyError::Failed) => {
                         self.stats.errors += 1;
                         continue;
                     }
-                }
-            };
+                    Err(ClassifyError::Skip) => continue,
+                };
 
-            let (metadata, file_type) = match collect_metadata(full_path) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Cannot read metadata for {}: {}", full_path.display(), e);
-                    self.stats.errors += 1;
-                    continue;
-                }
-            };
-
-            let (kind, symlink_target) = if file_type.is_file() {
-                self.stats.files += 1;
-                (EntryKind::File, None)
-            } else if file_type.is_dir() {
-                self.stats.directories += 1;
-                (EntryKind::Directory, None)
-            } else if file_type.is_symlink() {
-                self.stats.symlinks += 1;
-                match std::fs::read_link(full_path) {
-                    Ok(target) => (EntryKind::Symlink, Some(target)),
-                    Err(e) => {
-                        warn!("Cannot read symlink {}: {}", full_path.display(), e);
-                        self.stats.errors += 1;
-                        continue;
-                    }
-                }
-            } else {
-                warn!("Skipping special file {}", full_path.display());
-                continue;
-            };
-
-            self.stats.total_entries += 1;
+            self.stats.count(kind);
             self.walk_pb.inc(1);
 
             let mut removals_before = Vec::new();
@@ -413,9 +396,6 @@ impl<'a> Iterator for WalkStream<'a> {
                     return Some(Err(e));
                 }
                 if batch.is_empty() {
-                    // walkdir produced nothing new; either it has hit EOF
-                    // (walk_exhausted is set), or we filtered everything.
-                    // Loop: next iteration drains remaining old entries.
                     continue;
                 }
                 if self.hash_pb.is_none() && batch.iter().any(|p| p.kind == EntryKind::File) {
@@ -466,28 +446,18 @@ fn hash_pending(
     hash_pb: Option<&ProgressBar>,
 ) -> (Vec<Entry>, Option<(Entry, Option<Entry>)>) {
     let hash = if p.kind == EntryKind::File {
-        let reused = p
-            .old
-            .as_ref()
-            .filter(|o| o.kind == EntryKind::File && o.metadata.size_and_mtime_match(&p.metadata))
-            .and_then(|o| o.hash);
-        let hash = match reused {
-            Some(h) => Some(h),
-            None => {
-                let full_path = p.rel_path.to_full_path(root);
-                match hash_file(&full_path) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        warn!("Cannot hash {}: {}", full_path.display(), e);
-                        return (p.removals_before, None);
-                    }
+        match resolve_file_hash(&p.rel_path, &p.metadata, p.old.as_ref(), root) {
+            Ok((h, _reused)) => {
+                if let Some(pb) = hash_pb {
+                    pb.inc(1);
                 }
+                Some(h)
             }
-        };
-        if let Some(pb) = hash_pb {
-            pb.inc(1);
+            Err(e) => {
+                warn!("Cannot hash {}: {}", p.rel_path, e);
+                return (p.removals_before, None);
+            }
         }
-        hash
     } else {
         None
     };
@@ -501,6 +471,10 @@ fn hash_pending(
     };
     (p.removals_before, Some((new, p.old)))
 }
+
+// ---------------------------------------------------------------------------
+// Test helper
+// ---------------------------------------------------------------------------
 
 /// Convenience wrapper used by walk tests: drives `WalkStream` to
 /// completion and collects new-tree entries into a `Vec` for simple
@@ -620,7 +594,7 @@ mod tests {
     /// streaming diff.
     #[test]
     fn test_stream_merge_join_emits_added_removed_both() {
-        use crate::commands::snapshot::{run_snapshot, SnapshotReader};
+        use crate::commands::snapshot::{SnapshotReader, run_snapshot};
         let tmp = setup_test_tree();
         let root = tmp.path();
         let snap_dir = TempDir::new().unwrap();
@@ -673,7 +647,7 @@ mod tests {
     /// benefit of not loading the old snapshot into memory.
     #[test]
     fn test_stream_hash_reuse_via_snapshot_reader() {
-        use crate::commands::snapshot::{run_snapshot, SnapshotReader};
+        use crate::commands::snapshot::{SnapshotReader, run_snapshot};
         let tmp = setup_test_tree();
         let root = tmp.path();
         // Snapshot file kept OUTSIDE the walked tree so the walk sees the
