@@ -4,10 +4,8 @@ use crate::format::reader::FormatReader;
 use crate::format::writer::FormatWriter;
 use crate::fs::walk::walk_filesystem;
 use crate::model::entry::Entry;
-use crate::model::path::RelativePath;
 use crate::progress::Reporter;
 use log::info;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -40,7 +38,10 @@ pub fn run_snapshot(
 
     // Walk the file system
     info!("Walking filesystem under {}", root_dir.display());
-    let (entries, stats) = walk_filesystem(&root_dir, previous_entries.as_deref(), reporter)?;
+    let (mut entries, stats) = walk_filesystem(&root_dir, previous_entries.as_deref(), reporter)?;
+
+    info!("Computing directory hashes");
+    crate::fs::walk::compute_dir_hashes(&mut entries);
 
     info!("Writing snapshot to {}", snapshot_out.display());
     let file = File::create(snapshot_out)?;
@@ -133,11 +134,3 @@ pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
     Ok((entries, header))
 }
 
-/// Load a snapshot from a file, returning the entries as a HashMap for O(1) lookup
-pub fn load_snapshot_entries(
-    snapshot_path: &Path,
-) -> Result<(HashMap<RelativePath, Entry>, FileHeader)> {
-    let (entries, header) = load_snapshot(snapshot_path)?;
-    let map = entries.into_iter().map(|e| (e.path.clone(), e)).collect();
-    Ok((map, header))
-}

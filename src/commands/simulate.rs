@@ -103,6 +103,7 @@ mod tests {
             },
             hash: None,
             symlink_target: None,
+            dir_hash: None,
         }
     }
 
@@ -113,6 +114,7 @@ mod tests {
             metadata: meta(mtime),
             hash: Some([hash; 16]),
             symlink_target: None,
+            dir_hash: None,
         }
     }
 
@@ -230,6 +232,7 @@ mod tests {
             metadata: meta(0),
             hash: None,
             symlink_target: Some(target),
+            dir_hash: None,
         };
         let mut state = build_state(vec![entry]);
         let changes = vec![Change {

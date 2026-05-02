@@ -9,6 +9,7 @@ pub struct TestFixture {
     pub working_dir: TempDir,
 }
 
+// Kept for regression - usage in `roundtrip_test.rs`
 impl TestFixture {
     pub fn new() -> Self {
         TestFixture {

@@ -48,6 +48,15 @@ impl RelativePath {
     pub fn parent(&self) -> Option<RelativePath> {
         self.0.parent().map(|p| RelativePath(p.to_path_buf()))
     }
+
+    /// True if `child` is strictly underneath `self` (a directory path).
+    pub fn contains(&self, child: &RelativePath) -> bool {
+        if self.0.as_os_str().is_empty() {
+            !child.0.as_os_str().is_empty()
+        } else {
+            child.0.starts_with(&self.0) && child.0 != self.0
+        }
+    }
 }
 
 impl AsRef<Path> for RelativePath {

@@ -1,12 +1,13 @@
 use crate::commands::apply::parse_diff_metadata;
 use crate::commands::simulate::simulate_apply;
-use crate::commands::snapshot::load_snapshot_entries;
+use crate::commands::snapshot::load_snapshot;
 use crate::error::{GappedError, Result};
-use crate::fs::walk::walk_filesystem;
-use crate::model::entry::Entry;
+use crate::fs::walk::{compute_dir_hashes, walk_filesystem};
+use crate::model::entry::{Entry, EntryKind};
 use crate::model::path::RelativePath;
 use crate::progress::Reporter;
 use log::info;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -23,8 +24,11 @@ pub fn run_verify(
 
     info!("Loading snapshot from {}", snapshot_path.display());
     let load_pb = reporter.spinner("Loading target snapshot");
-    let (target_entries, _) = load_snapshot_entries(snapshot_path)?;
-    load_pb.finish_with_message(format!("Loaded {} entries from target snapshot", target_entries.len()));
+    let (target_entries, _) = load_snapshot(snapshot_path)?;
+    load_pb.finish_with_message(format!(
+        "Loaded {} entries from target snapshot",
+        target_entries.len()
+    ));
 
     info!("Walk filesystem at {}", root_dir.display());
     let (current_entries_vec, _) = walk_filesystem(&root_dir, None, reporter)?;
@@ -43,8 +47,12 @@ pub fn run_verify(
     let implicit_dirs = simulate_apply(&mut simulated, &changes);
     sim_pb.finish_and_clear();
 
-    let cmp_pb = reporter.spinner("Comparing entries");
-    let discrepancies = compare_entries(&simulated, &target_entries, &implicit_dirs);
+    let mut simulated_vec: Vec<Entry> = simulated.into_values().collect();
+    simulated_vec.sort_by(|a, b| a.path.cmp(&b.path));
+    compute_dir_hashes(&mut simulated_vec);
+
+    let cmp_pb = reporter.spinner("Comparing entries (Merkle-accelerated)");
+    let discrepancies = compare_with_merkle(&simulated_vec, &target_entries, &implicit_dirs);
     cmp_pb.finish_and_clear();
 
     for msg in &discrepancies {
@@ -60,62 +68,118 @@ pub fn run_verify(
     }
 }
 
-/// Compare simulated entries against target entries. Returns discrepancy messages.
+/// Merkle-accelerated comparison of two sorted entry lists.
 ///
-/// `implicit_dirs` is the set of directories that `apply` will leave alone
-/// (parent dirs touched by child changes but without an explicit entry in the
-/// diff). For those, the metadata comparison is skipped — apply preserves the
-/// target's existing mtime, so any drift between target and snapshot is
-/// expected and not actionable.
-fn compare_entries(
-    simulated: &HashMap<RelativePath, Entry>,
-    target: &HashMap<RelativePath, Entry>,
+/// When both sides have a directory with matching `dir_hash`, the entire
+/// subtree is skipped. `implicit_dirs` are directories whose metadata
+/// should not be compared (apply preserves their existing mtime).
+fn compare_with_merkle(
+    simulated: &[Entry],
+    target: &[Entry],
     implicit_dirs: &HashSet<RelativePath>,
 ) -> Vec<String> {
     let mut discrepancies = Vec::new();
+    let mut sim_iter = simulated.iter().enumerate().peekable();
+    let mut tgt_iter = target.iter().enumerate().peekable();
 
-    for (path, target_entry) in target {
-        match simulated.get(path) {
-            None => {
+    loop {
+        let sim_entry = sim_iter.peek().map(|&(_, e)| e);
+        let tgt_entry = tgt_iter.peek().map(|&(_, e)| e);
+
+        match (sim_entry, tgt_entry) {
+            (Some(sim), Some(tgt)) => match sim.path.cmp(&tgt.path) {
+                Ordering::Less => {
+                    discrepancies.push(format!(
+                        "EXTRA: {} (in simulated state but not in snapshot)",
+                        sim.path
+                    ));
+                    sim_iter.next();
+                }
+                Ordering::Greater => {
+                    discrepancies.push(format!(
+                        "MISSING: {} (in snapshot but not in simulated state)",
+                        tgt.path
+                    ));
+                    tgt_iter.next();
+                }
+                Ordering::Equal => {
+                    if sim.kind == EntryKind::Directory
+                        && tgt.kind == EntryKind::Directory
+                        && sim.dir_hash.is_some()
+                        && sim.dir_hash == tgt.dir_hash
+                        && !implicit_dirs.contains(&sim.path)
+                    {
+                        let dir_path = sim.path.clone();
+                        skip_subtree_verify(&mut sim_iter, &dir_path, simulated);
+                        skip_subtree_verify(&mut tgt_iter, &dir_path, target);
+                    } else {
+                        compare_single_entry(sim, tgt, implicit_dirs, &mut discrepancies);
+                        sim_iter.next();
+                        tgt_iter.next();
+                    }
+                }
+            },
+            (Some(sim), None) => {
+                discrepancies.push(format!(
+                    "EXTRA: {} (in simulated state but not in snapshot)",
+                    sim.path
+                ));
+                sim_iter.next();
+            }
+            (None, Some(tgt)) => {
                 discrepancies.push(format!(
                     "MISSING: {} (in snapshot but not in simulated state)",
-                    path
+                    tgt.path
                 ));
+                tgt_iter.next();
             }
-            Some(simulated_entry) => {
-                if simulated_entry.kind != target_entry.kind {
-                    discrepancies.push(format!(
-                        "KIND MISMATCH: {} (expected {:?}, got {:?})",
-                        path, target_entry.kind, simulated_entry.kind
-                    ));
-                }
-                if !implicit_dirs.contains(path)
-                    && !simulated_entry.metadata.matches(&target_entry.metadata)
-                {
-                    discrepancies.push(format!("METADATA MISMATCH: {}", path));
-                    discrepancies.push(format!("  simulated: {:?}", simulated_entry.metadata));
-                    discrepancies.push(format!("  target:    {:?}", target_entry.metadata));
-                }
-                if simulated_entry.hash != target_entry.hash {
-                    discrepancies.push(format!("HASH MISMATCH: {}", path));
-                }
-                if simulated_entry.symlink_target != target_entry.symlink_target {
-                    discrepancies.push(format!("SYMLINK MISMATCH: {}", path));
-                }
-            }
-        }
-    }
-
-    for path in simulated.keys() {
-        if !target.contains_key(path) {
-            discrepancies.push(format!(
-                "EXTRA: {} (in simulated state but not in snapshot)",
-                path
-            ));
+            (None, None) => break,
         }
     }
 
     discrepancies
+}
+
+fn skip_subtree_verify<'a, I>(
+    iter: &mut std::iter::Peekable<I>,
+    dir_path: &RelativePath,
+    entries: &[Entry],
+) where
+    I: Iterator<Item = (usize, &'a Entry)>,
+{
+    iter.next();
+    while let Some(&(idx, _)) = iter.peek() {
+        if dir_path.contains(&entries[idx].path) {
+            iter.next();
+        } else {
+            break;
+        }
+    }
+}
+
+fn compare_single_entry(
+    sim: &Entry,
+    tgt: &Entry,
+    implicit_dirs: &HashSet<RelativePath>,
+    discrepancies: &mut Vec<String>,
+) {
+    if sim.kind != tgt.kind {
+        discrepancies.push(format!(
+            "KIND MISMATCH: {} (expected {:?}, got {:?})",
+            tgt.path, tgt.kind, sim.kind
+        ));
+    }
+    if !implicit_dirs.contains(&sim.path) && !sim.metadata.matches(&tgt.metadata) {
+        discrepancies.push(format!("METADATA MISMATCH: {}", sim.path));
+        discrepancies.push(format!("  simulated: {:?}", sim.metadata));
+        discrepancies.push(format!("  target:    {:?}", tgt.metadata));
+    }
+    if sim.hash != tgt.hash {
+        discrepancies.push(format!("HASH MISMATCH: {}", sim.path));
+    }
+    if sim.symlink_target != tgt.symlink_target {
+        discrepancies.push(format!("SYMLINK MISMATCH: {}", sim.path));
+    }
 }
 
 #[cfg(test)]

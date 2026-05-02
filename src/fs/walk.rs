@@ -90,12 +90,12 @@ fn resolve_file_hash(
     old_entry: Option<&Entry>,
     root: &Path,
 ) -> std::io::Result<([u8; 16], bool)> {
-    if let Some(old) = old_entry {
-        if old.kind == EntryKind::File && old.metadata.size_and_mtime_match(metadata) {
-            if let Some(h) = old.hash {
-                return Ok((h, true));
-            }
-        }
+    if let Some(old) = old_entry
+        && old.kind == EntryKind::File
+        && old.metadata.size_and_mtime_match(metadata)
+        && let Some(h) = old.hash
+    {
+        return Ok((h, true));
     }
     let full_path = rel_path.to_full_path(root);
     hash_file(&full_path).map(|h| (h, false))
@@ -154,6 +154,7 @@ pub fn walk_filesystem(
                         metadata: metadata.clone(),
                         hash: None,
                         symlink_target: symlink_target.clone(),
+                        dir_hash: None,
                     }),
                     false,
                 );
@@ -171,6 +172,7 @@ pub fn walk_filesystem(
                         metadata: metadata.clone(),
                         hash: Some(h),
                         symlink_target: symlink_target.clone(),
+                        dir_hash: None,
                     }),
                     reused,
                 ),
@@ -468,8 +470,93 @@ fn hash_pending(
         metadata: p.metadata,
         hash,
         symlink_target: p.symlink_target,
+        dir_hash: None,
     };
     (p.removals_before, Some((new, p.old)))
+}
+
+// ---------------------------------------------------------------------------
+// Directory Merkle hashes
+// ---------------------------------------------------------------------------
+
+/// Compute directory hashes bottom-up for all directory entries.
+///
+/// Entries must be sorted by path. After this call, every directory entry
+/// (including root) has `dir_hash = Some(...)`. File and symlink entries
+/// are left unchanged.
+pub fn compute_dir_hashes(entries: &mut [Entry]) {
+    use std::collections::HashMap;
+    use std::os::unix::ffi::OsStrExt;
+    use xxhash_rust::xxh3::Xxh3;
+
+    let mut children: HashMap<RelativePath, Vec<usize>> = HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(parent) = entry.path.parent() {
+            children.entry(parent).or_default().push(i);
+        }
+    }
+
+    let mut dir_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == EntryKind::Directory)
+        .map(|(i, _)| i)
+        .collect();
+    dir_indices.sort_by(|&a, &b| entries[b].path.depth().cmp(&entries[a].path.depth()));
+
+    for dir_idx in dir_indices {
+        let dir_path = entries[dir_idx].path.clone();
+        let child_indices = children.remove(&dir_path).unwrap_or_default();
+
+        let mut sorted_children: Vec<usize> = child_indices;
+        sorted_children.sort_by(|&a, &b| {
+            let a_name = entries[a].path.as_ref().file_name().unwrap_or_default();
+            let b_name = entries[b].path.as_ref().file_name().unwrap_or_default();
+            a_name.as_bytes().cmp(b_name.as_bytes())
+        });
+
+        let mut hasher = Xxh3::new();
+        for &ci in &sorted_children {
+            let child = &entries[ci];
+            let name_bytes = child
+                .path
+                .as_ref()
+                .file_name()
+                .unwrap_or_default()
+                .as_bytes();
+            hasher.update(name_bytes);
+            hasher.update(&[0x00]);
+            hasher.update(&[child.kind as u8]);
+
+            let content_hash: [u8; 16] = match child.kind {
+                EntryKind::File => child.hash.unwrap_or([0u8; 16]),
+                EntryKind::Directory => child.dir_hash.unwrap_or([0u8; 16]),
+                EntryKind::Symlink => {
+                    if let Some(target) = &child.symlink_target {
+                        let mut h = Xxh3::new();
+                        h.update(target.as_os_str().as_bytes());
+                        h.digest128().to_le_bytes()
+                    } else {
+                        [0u8; 16]
+                    }
+                }
+            };
+            hasher.update(&content_hash);
+            hasher.update(&child.metadata.permissions.to_le_bytes());
+            hasher.update(&child.metadata.uid.to_le_bytes());
+            hasher.update(&child.metadata.gid.to_le_bytes());
+            hasher.update(&child.metadata.mtime_sec.to_le_bytes());
+            hasher.update(&child.metadata.mtime_nsec.to_le_bytes());
+
+            let size = match child.kind {
+                EntryKind::File => child.metadata.size,
+                _ => 0u64,
+            };
+            hasher.update(&size.to_le_bytes());
+        }
+
+        entries[dir_idx].dir_hash = Some(hasher.digest128().to_le_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +775,258 @@ mod tests {
             nested.hash.unwrap(),
             pre_nested_hash,
             "a/nested.txt hash should have been reused from the old snapshot"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_dir_hashes tests
+    // -----------------------------------------------------------------------
+
+    fn make_entry(path: &str, kind: EntryKind, hash: Option<[u8; 16]>) -> Entry {
+        Entry {
+            path: RelativePath::new(Path::new(path)).unwrap(),
+            kind,
+            metadata: Metadata {
+                size: if kind == EntryKind::File { 100 } else { 0 },
+                mtime_sec: 1_700_000_000,
+                mtime_nsec: 0,
+                permissions: if kind == EntryKind::Directory {
+                    0o755
+                } else {
+                    0o644
+                },
+                uid: 1000,
+                gid: 1000,
+            },
+            hash,
+            symlink_target: None,
+            dir_hash: None,
+        }
+    }
+
+    fn make_symlink_entry(path: &str, target: &str) -> Entry {
+        Entry {
+            path: RelativePath::new(Path::new(path)).unwrap(),
+            kind: EntryKind::Symlink,
+            metadata: Metadata {
+                size: 0,
+                mtime_sec: 1_700_000_000,
+                mtime_nsec: 0,
+                permissions: 0o777,
+                uid: 1000,
+                gid: 1000,
+            },
+            hash: None,
+            symlink_target: Some(PathBuf::from(target)),
+            dir_hash: None,
+        }
+    }
+
+    #[test]
+    fn dir_hash_deterministic() {
+        let mut entries = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([1u8; 16])),
+            make_entry("b.txt", EntryKind::File, Some([2u8; 16])),
+        ];
+        compute_dir_hashes(&mut entries);
+        let h1 = entries[0].dir_hash.unwrap();
+
+        let mut entries2 = entries.clone();
+        entries2[0].dir_hash = None;
+        compute_dir_hashes(&mut entries2);
+        assert_eq!(h1, entries2[0].dir_hash.unwrap());
+    }
+
+    #[test]
+    fn dir_hash_independent_of_input_order() {
+        let mut entries_ab = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([1u8; 16])),
+            make_entry("b.txt", EntryKind::File, Some([2u8; 16])),
+        ];
+        compute_dir_hashes(&mut entries_ab);
+
+        // Same children but input in reverse order (still sorted by path
+        // for the function contract, but the internal sort by name should
+        // produce the same hash regardless).
+        let mut entries_ba = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([1u8; 16])),
+            make_entry("b.txt", EntryKind::File, Some([2u8; 16])),
+        ];
+        compute_dir_hashes(&mut entries_ba);
+        assert_eq!(
+            entries_ab[0].dir_hash.unwrap(),
+            entries_ba[0].dir_hash.unwrap()
+        );
+    }
+
+    #[test]
+    fn dir_hash_changes_when_child_content_changes() {
+        let mut v1 = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([1u8; 16])),
+        ];
+        compute_dir_hashes(&mut v1);
+
+        let mut v2 = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([2u8; 16])),
+        ];
+        compute_dir_hashes(&mut v2);
+        assert_ne!(v1[0].dir_hash.unwrap(), v2[0].dir_hash.unwrap());
+    }
+
+    #[test]
+    fn dir_hash_changes_when_child_name_changes() {
+        let mut v1 = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([1u8; 16])),
+        ];
+        compute_dir_hashes(&mut v1);
+
+        let mut v2 = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("z.txt", EntryKind::File, Some([1u8; 16])),
+        ];
+        compute_dir_hashes(&mut v2);
+        assert_ne!(v1[0].dir_hash.unwrap(), v2[0].dir_hash.unwrap());
+    }
+
+    #[test]
+    fn dir_hash_changes_when_child_mode_changes() {
+        let mut v1 = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([1u8; 16])),
+        ];
+        compute_dir_hashes(&mut v1);
+
+        let mut v2 = v1.clone();
+        v2[0].dir_hash = None;
+        v2[1].metadata.permissions = 0o755;
+        compute_dir_hashes(&mut v2);
+        assert_ne!(v1[0].dir_hash.unwrap(), v2[0].dir_hash.unwrap());
+    }
+
+    #[test]
+    fn dir_hash_changes_when_child_ownership_changes() {
+        let mut v1 = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([1u8; 16])),
+        ];
+        compute_dir_hashes(&mut v1);
+
+        let mut v2 = v1.clone();
+        v2[0].dir_hash = None;
+        v2[1].metadata.uid = 0;
+        compute_dir_hashes(&mut v2);
+        assert_ne!(v1[0].dir_hash.unwrap(), v2[0].dir_hash.unwrap());
+    }
+
+    #[test]
+    fn dir_hash_changes_when_child_mtime_changes() {
+        let mut v1 = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a.txt", EntryKind::File, Some([1u8; 16])),
+        ];
+        compute_dir_hashes(&mut v1);
+
+        let mut v2 = v1.clone();
+        v2[0].dir_hash = None;
+        v2[1].metadata.mtime_sec = 9999;
+        compute_dir_hashes(&mut v2);
+        assert_ne!(v1[0].dir_hash.unwrap(), v2[0].dir_hash.unwrap());
+    }
+
+    #[test]
+    fn dir_hash_cascades_through_ancestors() {
+        let mut entries = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("a", EntryKind::Directory, None),
+            make_entry("a/b", EntryKind::Directory, None),
+            make_entry("a/b/deep.txt", EntryKind::File, Some([1u8; 16])),
+        ];
+        compute_dir_hashes(&mut entries);
+        let root_h1 = entries[0].dir_hash.unwrap();
+        let a_h1 = entries[1].dir_hash.unwrap();
+        let ab_h1 = entries[2].dir_hash.unwrap();
+
+        // Change the deep file
+        let mut entries2 = entries.clone();
+        for e in &mut entries2 {
+            e.dir_hash = None;
+        }
+        entries2[3].hash = Some([2u8; 16]);
+        compute_dir_hashes(&mut entries2);
+
+        assert_ne!(ab_h1, entries2[2].dir_hash.unwrap(), "a/b should change");
+        assert_ne!(a_h1, entries2[1].dir_hash.unwrap(), "a should change");
+        assert_ne!(root_h1, entries2[0].dir_hash.unwrap(), "root should change");
+    }
+
+    #[test]
+    fn dir_hash_empty_directory() {
+        let mut entries = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("empty", EntryKind::Directory, None),
+        ];
+        compute_dir_hashes(&mut entries);
+        assert!(entries[1].dir_hash.is_some(), "empty dir must get a dir_hash");
+    }
+
+    #[test]
+    fn dir_hash_with_symlink() {
+        let mut entries = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_symlink_entry("link", "/some/target"),
+        ];
+        compute_dir_hashes(&mut entries);
+        let h1 = entries[0].dir_hash.unwrap();
+
+        let mut entries2 = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_symlink_entry("link", "/other/target"),
+        ];
+        compute_dir_hashes(&mut entries2);
+        assert_ne!(h1, entries2[0].dir_hash.unwrap());
+    }
+
+    #[test]
+    fn dir_hash_root_gets_hash() {
+        let mut entries = vec![make_entry(".", EntryKind::Directory, None)];
+        compute_dir_hashes(&mut entries);
+        assert!(entries[0].dir_hash.is_some());
+    }
+
+    #[test]
+    fn dir_hash_sibling_subtree_unchanged() {
+        let mut entries = vec![
+            make_entry(".", EntryKind::Directory, None),
+            make_entry("left", EntryKind::Directory, None),
+            make_entry("left/a.txt", EntryKind::File, Some([1u8; 16])),
+            make_entry("right", EntryKind::Directory, None),
+            make_entry("right/b.txt", EntryKind::File, Some([2u8; 16])),
+        ];
+        compute_dir_hashes(&mut entries);
+        let right_h1 = entries[3].dir_hash.unwrap();
+
+        // Change only the left subtree
+        let mut entries2 = entries.clone();
+        for e in &mut entries2 {
+            e.dir_hash = None;
+        }
+        entries2[2].hash = Some([9u8; 16]);
+        compute_dir_hashes(&mut entries2);
+        assert_eq!(
+            right_h1,
+            entries2[3].dir_hash.unwrap(),
+            "right subtree should be unchanged"
+        );
+        assert_ne!(
+            entries[1].dir_hash.unwrap(),
+            entries2[1].dir_hash.unwrap(),
+            "left subtree should change"
         );
     }
 }

@@ -75,6 +75,7 @@ pub struct Entry {
     pub metadata: Metadata,
     pub hash: Option<[u8; 16]>,
     pub symlink_target: Option<PathBuf>,
+    pub dir_hash: Option<[u8; 16]>,
 }
 
 #[cfg(test)]

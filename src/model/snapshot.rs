@@ -10,5 +10,5 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 }

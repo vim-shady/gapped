@@ -5,11 +5,11 @@ use crate::format::writer::FormatWriter;
 use crate::fs::walk::{WalkItem, WalkStats, WalkStream};
 use crate::model::diff::{AddedEntry, Change, ChangeKind, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
+use crate::model::path::RelativePath;
 use crate::parallel::{self, Chunk, ContentReader};
 use crate::progress::Reporter;
 use crossbeam_channel::{Receiver, Sender};
 use log::info;
-#[cfg(test)]
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -37,25 +37,35 @@ pub fn run_diff(
         })?;
     hash_pb.finish_and_clear();
 
-    // streaming merge-join
     info!("Opening input snapshot {}", snapshot_in.display());
     let (prev_reader, _old_header) = SnapshotReader::open(snapshot_in)?;
 
+    info!("Walking filesystem under {}", root_dir.display());
+    let walk_stream = WalkStream::new(&root_dir, Some(prev_reader), reporter);
+    let collected = collect_walk(walk_stream)?;
+
+    let mut new_entries = collected.new_entries;
+    let old_entries = collected.old_entries;
+
+    info!("Computing directory hashes");
+    crate::fs::walk::compute_dir_hashes(&mut new_entries);
+
+    let snapshot_pb = reporter.spinner("Writing new snapshot");
     let snap_file = File::create(snapshot_out)?;
     let snap_buf = BufWriter::new(snap_file);
     let snap_header = FileHeader::snapshot(&root_dir);
     let mut snap_writer = FormatWriter::maybe_compressed(snap_buf, &snap_header, compress)?;
-    let snapshot_pb = reporter.spinner("Writing new snapshot");
-
-    info!("Walking filesystem under {}", root_dir.display());
-    let walk_stream = WalkStream::new(&root_dir, Some(prev_reader), reporter);
-    let result = compute_changes(walk_stream, &mut snap_writer)?;
-
+    for entry in &new_entries {
+        snap_writer.write_snapshot_entry(entry)?;
+    }
     snap_writer.finish()?;
     snapshot_pb.finish_with_message(format!(
         "Wrote {} snapshot entries",
-        result.snapshot_entries
+        new_entries.len()
     ));
+
+    info!("Computing diff with Merkle optimization");
+    let result = compute_diff_merkle(&old_entries, &new_entries, &root_dir)?;
 
     if let Some(max_bytes) = split_size {
         write_split_diff(
@@ -82,12 +92,45 @@ pub fn run_diff(
     eprintln!("  Added: {}", result.added);
     eprintln!("  Modified: {}", result.modified);
     eprintln!("  Deleted: {}", result.removed);
+    eprintln!("  Skipped (Merkle): {}", result.skipped);
     eprintln!("  Total changes: {}", result.changes.len());
-    if result.stats.errors > 0 {
-        eprintln!("  Walk errors: {}", result.stats.errors);
+    if collected.stats.errors > 0 {
+        eprintln!("  Walk errors: {}", collected.stats.errors);
     }
 
     Ok(())
+}
+
+struct CollectedWalk {
+    new_entries: Vec<Entry>,
+    old_entries: Vec<Entry>,
+    stats: WalkStats,
+}
+
+fn collect_walk(mut walk: WalkStream<'_>) -> Result<CollectedWalk> {
+    let mut new_entries = Vec::new();
+    let mut old_entries = Vec::new();
+
+    for item in walk.by_ref() {
+        match item? {
+            WalkItem::Added(new) => {
+                new_entries.push(new);
+            }
+            WalkItem::Both { new, old } => {
+                new_entries.push(new);
+                old_entries.push(old);
+            }
+            WalkItem::Removed(old) => {
+                old_entries.push(old);
+            }
+        }
+    }
+
+    Ok(CollectedWalk {
+        new_entries,
+        old_entries,
+        stats: walk.into_stats(),
+    })
 }
 
 struct DiffResult {
@@ -95,45 +138,74 @@ struct DiffResult {
     added: usize,
     modified: usize,
     removed: usize,
-    snapshot_entries: u64,
-    stats: WalkStats,
+    skipped: usize,
 }
 
-/// Consume a `WalkStream`, classify each item as a `Change`, and write new
-/// entries to the snapshot on the fly.
-fn compute_changes<W: Write>(
-    mut walk: WalkStream<'_>,
-    snap_writer: &mut FormatWriter<W>,
+/// Merge-join old and new entries with Merkle short-circuiting.
+///
+/// When both sides have a directory with matching `dir_hash`, the entire
+/// subtree is skipped — no changes are emitted for anything under that
+/// directory.
+fn compute_diff_merkle(
+    old_entries: &[Entry],
+    new_entries: &[Entry],
+    _root_dir: &Path,
 ) -> Result<DiffResult> {
     let mut changes = Vec::new();
-    let (mut added, mut modified, mut removed) = (0, 0, 0);
-    let mut snapshot_entries: u64 = 0;
+    let (mut added, mut modified, mut removed, mut skipped) = (0, 0, 0, 0);
+    let mut old_iter = old_entries.iter().enumerate().peekable();
+    let mut new_iter = new_entries.iter().enumerate().peekable();
 
-    for item in walk.by_ref() {
-        match item? {
-            WalkItem::Added(new) => {
-                snap_writer.write_snapshot_entry(&new)?;
-                snapshot_entries += 1;
-                changes.push(build_added_change(&new));
-                added += 1;
-            }
-            WalkItem::Both { new, old } => {
-                snap_writer.write_snapshot_entry(&new)?;
-                snapshot_entries += 1;
-                if new.kind != old.kind {
-                    changes.push(build_removed_change(&old));
-                    changes.push(build_added_change(&new));
+    loop {
+        match (old_iter.peek(), new_iter.peek()) {
+            (Some((_, old)), Some((_, new))) => match old.path.cmp(&new.path) {
+                Ordering::Less => {
+                    changes.push(build_removed_change(old));
                     removed += 1;
-                    added += 1;
-                } else if let Some(change) = compute_entry_diff(&old, &new) {
-                    changes.push(change);
-                    modified += 1;
+                    old_iter.next();
                 }
-            }
-            WalkItem::Removed(old) => {
-                changes.push(build_removed_change(&old));
+                Ordering::Greater => {
+                    changes.push(build_added_change(new));
+                    added += 1;
+                    new_iter.next();
+                }
+                Ordering::Equal => {
+                    if old.kind == EntryKind::Directory
+                        && new.kind == EntryKind::Directory
+                        && old.dir_hash.is_some()
+                        && old.dir_hash == new.dir_hash
+                    {
+                        let dir_path = &old.path;
+                        skipped += skip_subtree(&mut old_iter, dir_path, old_entries);
+                        skipped += skip_subtree(&mut new_iter, dir_path, new_entries);
+                    } else if old.kind != new.kind {
+                        changes.push(build_removed_change(old));
+                        changes.push(build_added_change(new));
+                        removed += 1;
+                        added += 1;
+                        old_iter.next();
+                        new_iter.next();
+                    } else {
+                        if let Some(change) = compute_entry_diff(old, new) {
+                            changes.push(change);
+                            modified += 1;
+                        }
+                        old_iter.next();
+                        new_iter.next();
+                    }
+                }
+            },
+            (Some((_, old)), None) => {
+                changes.push(build_removed_change(old));
                 removed += 1;
+                old_iter.next();
             }
+            (None, Some((_, new))) => {
+                changes.push(build_added_change(new));
+                added += 1;
+                new_iter.next();
+            }
+            (None, None) => break,
         }
     }
 
@@ -142,9 +214,30 @@ fn compute_changes<W: Write>(
         added,
         modified,
         removed,
-        snapshot_entries,
-        stats: walk.into_stats(),
+        skipped,
     })
+}
+
+/// Advance a peekable iterator past all entries under `dir_path`, including
+/// the directory entry itself. Returns the count of skipped entries.
+fn skip_subtree<'a, I>(iter: &mut std::iter::Peekable<I>, dir_path: &RelativePath, entries: &[Entry]) -> usize
+where
+    I: Iterator<Item = (usize, &'a Entry)>,
+{
+    let mut count = 0;
+    // Skip the directory entry itself
+    iter.next();
+    count += 1;
+    // Skip all children
+    while let Some(&(idx, _)) = iter.peek() {
+        if dir_path.contains(&entries[idx].path) {
+            iter.next();
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 fn write_single_diff(
@@ -558,54 +651,14 @@ fn build_added_change(entry: &Entry) -> Change {
     }
 }
 
-/// Reference merge-join used only by the unit tests. this function exists to keep the
-/// test suite able to exercise the merge logic on small
-/// snapshots without needing a real filesystem walk.
+/// Reference merge-join used only by the unit tests.
 #[cfg(test)]
 fn compute_diff(
     old_entries: &[Entry],
     new_entries: &[Entry],
-    _root_dir: &Path,
+    root_dir: &Path,
 ) -> Result<Vec<Change>> {
-    let mut diff = Vec::new();
-    let mut old_iter = old_entries.iter().peekable();
-    let mut new_iter = new_entries.iter().peekable();
-
-    loop {
-        match (old_iter.peek(), new_iter.peek()) {
-            (Some(old), Some(new)) => match old.path.cmp(&new.path) {
-                Ordering::Less => {
-                    diff.push(build_removed_change(old));
-                    old_iter.next();
-                }
-                Ordering::Greater => {
-                    diff.push(build_added_change(new));
-                    new_iter.next();
-                }
-                Ordering::Equal => {
-                    if old.kind != new.kind {
-                        diff.push(build_removed_change(old));
-                        diff.push(build_added_change(new));
-                    } else if let Some(change) = compute_entry_diff(old, new) {
-                        diff.push(change);
-                    }
-                    old_iter.next();
-                    new_iter.next();
-                }
-            },
-            (Some(old), None) => {
-                diff.push(build_removed_change(old));
-                old_iter.next();
-            }
-            (None, Some(new)) => {
-                diff.push(build_added_change(new));
-                new_iter.next();
-            }
-            (None, None) => break,
-        }
-    }
-
-    Ok(diff)
+    Ok(compute_diff_merkle(old_entries, new_entries, root_dir)?.changes)
 }
 
 #[cfg(test)]
@@ -633,6 +686,7 @@ mod tests {
             metadata: make_metadata(size, mtime_sec, 0o644),
             hash,
             symlink_target: None,
+            dir_hash: None,
         }
     }
 
@@ -643,6 +697,7 @@ mod tests {
             metadata: make_metadata(0, mtime, 0o755),
             hash: None,
             symlink_target: None,
+            dir_hash: None,
         }
     }
 
@@ -653,6 +708,7 @@ mod tests {
             metadata: make_metadata(0, 0, 0o777),
             hash: None,
             symlink_target: Some(PathBuf::from(target)),
+            dir_hash: None,
         }
     }
 
