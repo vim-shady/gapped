@@ -8,13 +8,11 @@ use xxhash_rust::xxh3::Xxh3;
 
 const STREAM_BUF: usize = 64 * 1024;
 
-/// Header of a record
 pub struct RecordHeader {
     pub record_type: RecordType,
     pub payload_len: u64,
 }
 
-/// Streaming reader for gapped file format
 pub struct FormatReader {
     inner: Box<dyn Read>,
     hasher: Xxh3,
@@ -25,7 +23,6 @@ impl FormatReader {
     pub fn new<R: Read + 'static>(mut inner: R) -> Result<(Self, FileHeader)> {
         let mut hasher = Xxh3::new();
 
-        // Read magic bytes
         let mut magic = [0u8; MAGIC_LEN];
         inner.read_exact(&mut magic)?;
         hasher.update(&magic);
@@ -42,21 +39,16 @@ impl FormatReader {
         };
 
         let mut reader: Box<dyn Read> = if compressed {
-            let buf_reader = BufReader::new(inner);
-            let decoder = zstd::stream::read::Decoder::new(buf_reader)?;
-            Box::new(decoder)
+            Box::new(zstd::stream::read::Decoder::new(BufReader::new(inner))?)
         } else {
             Box::new(inner)
         };
 
-        // Read header length
         let mut len_bytes = [0u8; 4];
         reader.read_exact(&mut len_bytes)?;
         hasher.update(&len_bytes);
-        let header_len = u32::from_le_bytes(len_bytes) as usize;
 
-        // Read header payload
-        let mut header_bytes = vec![0u8; header_len];
+        let mut header_bytes = vec![0u8; u32::from_le_bytes(len_bytes) as usize];
         reader.read_exact(&mut header_bytes)?;
         hasher.update(&header_bytes);
 
@@ -72,6 +64,12 @@ impl FormatReader {
         ))
     }
 
+    fn hashed_read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_exact(buf)?;
+        self.hasher.update(buf);
+        Ok(())
+    }
+
     /// Read the next record header. Returns `None` at EOR.
     /// After calling this, one must consume the payload via `read_payload`,
     /// `skip_payload`, or `copy_payload_to` before calling this again.
@@ -80,26 +78,20 @@ impl FormatReader {
             return Ok(None);
         }
 
-        // Read record length + type byte
         let mut len_bytes = [0u8; RECORD_LEN_SIZE];
-        self.inner.read_exact(&mut len_bytes)?;
         let mut type_byte = [0u8; RECORD_TYPE_SIZE];
-        self.inner.read_exact(&mut type_byte)?;
+        self.hashed_read_exact(&mut len_bytes)?;
+        self.hashed_read_exact(&mut type_byte)?;
 
-        // Check for EOR
         if len_bytes == [0u8; RECORD_LEN_SIZE] && type_byte[0] == 0 {
-            self.hasher.update(&len_bytes);
-            self.hasher.update(&type_byte);
-
-            // Read and verify checksum
             let mut checksum_bytes = [0u8; CHECKSUM_LEN];
             self.inner.read_exact(&mut checksum_bytes)?;
 
             let expected_hash = self.hasher.digest128().to_le_bytes();
             if expected_hash != checksum_bytes {
                 return Err(GappedError::ChecksumMismatch {
-                    expected: Self::hex_encode(&expected_hash),
-                    got: Self::hex_encode(&checksum_bytes),
+                    expected: hex_encode(&expected_hash),
+                    got: hex_encode(&checksum_bytes),
                 });
             }
             self.finished = true;
@@ -109,46 +101,36 @@ impl FormatReader {
         let record_type = RecordType::from_u8(type_byte[0]).ok_or_else(|| {
             GappedError::InvalidFormat(format!("Unknown record type: {:?}", type_byte[0]))
         })?;
-        let payload_len = u64::from_le_bytes(len_bytes);
-
-        self.hasher.update(&len_bytes);
-        self.hasher.update(&type_byte);
 
         Ok(Some(RecordHeader {
             record_type,
-            payload_len,
+            payload_len: u64::from_le_bytes(len_bytes),
         }))
     }
 
-    /// Read a payload into memory and update the hasher.
     pub fn read_payload(&mut self, len: u64) -> Result<Vec<u8>> {
         let mut payload = vec![0u8; len as usize];
-        self.inner.read_exact(&mut payload)?;
-        self.hasher.update(&payload);
+        self.hashed_read_exact(&mut payload)?;
         Ok(payload)
     }
 
-    /// Skip a payload without materializing it.
     pub fn skip_payload(&mut self, len: u64) -> Result<()> {
         self.copy_payload_to(len, &mut std::io::sink())
     }
 
-    /// Stream a payload to a writer without materializing it and update the hasher.
     pub fn copy_payload_to<W: Write>(&mut self, len: u64, dest: &mut W) -> Result<()> {
-        // 64 KiB: stack-allocated
         let mut buf = [0u8; STREAM_BUF];
         let mut remaining = len;
         while remaining > 0 {
             let to_read = (remaining as usize).min(buf.len());
-            self.inner.read_exact(&mut buf[..to_read])?;
-            self.hasher.update(&buf[..to_read]);
+            self.hashed_read_exact(&mut buf[..to_read])?;
             dest.write_all(&buf[..to_read])?;
             remaining -= to_read as u64;
         }
         Ok(())
     }
+}
 
-    fn hex_encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{:02x}", b)).collect()
-    }
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

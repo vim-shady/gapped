@@ -41,7 +41,7 @@ pub fn run_snapshot(
     let (mut entries, stats) = walk_filesystem(&root_dir, previous_entries.as_deref(), reporter)?;
 
     info!("Computing directory hashes");
-    crate::fs::walk::compute_dir_hashes(&mut entries);
+    crate::fs::hash::compute_dir_hashes(&mut entries);
 
     info!("Writing snapshot to {}", snapshot_out.display());
     let file = File::create(snapshot_out)?;
@@ -72,64 +72,22 @@ pub fn run_snapshot(
     Ok(())
 }
 
-/// Streaming iterator over snapshot entries.
-///
-/// Reads one entry at a time from a snapshot file without materialising the
-/// whole list. Snapshots are written in path-sorted order, so iteration
-/// order matches that sort
-pub struct SnapshotReader {
-    format_reader: FormatReader,
-    finished: bool,
-}
-
-impl SnapshotReader {
-    pub fn open(path: &Path) -> Result<(Self, FileHeader)> {
-        let file = File::open(path)?;
-        let reader = std::io::BufReader::with_capacity(READ_BUF, file);
-        let (format_reader, header) = FormatReader::new(reader)?;
-        Ok((
-            Self {
-                format_reader,
-                finished: false,
-            },
-            header,
-        ))
-    }
-
-    /// Read the next entry. Non-entry records are skipped automatically.
-    /// Returns `Ok(None)` at EOR.
-    pub fn next_entry(&mut self) -> Result<Option<Entry>> {
-        if self.finished {
-            return Ok(None);
-        }
-        loop {
-            match self.format_reader.next_record_header()? {
-                None => {
-                    self.finished = true;
-                    return Ok(None);
-                }
-                Some(h) if h.record_type == RecordType::SnapshotEntry => {
-                    let payload = self.format_reader.read_payload(h.payload_len)?;
-                    let entry: Entry = rmp_serde::from_slice(&payload)?;
-                    return Ok(Some(entry));
-                }
-                Some(h) => self.format_reader.skip_payload(h.payload_len)?,
-            }
-        }
-    }
-}
-
 /// Load a snapshot from a file (should already be sorted by path).
-///
-/// Convenience wrapper around [`SnapshotReader`] for callers that legitimately
-/// need the whole list (tests, the current verify path). New code that does
-/// streaming comparison should use `SnapshotReader` directly to keep memory
-/// bounded.
 pub fn load_snapshot(snapshot_path: &Path) -> Result<(Vec<Entry>, FileHeader)> {
-    let (mut reader, header) = SnapshotReader::open(snapshot_path)?;
+    let file = File::open(snapshot_path)?;
+    let reader = std::io::BufReader::with_capacity(READ_BUF, file);
+    let (mut format_reader, header) = FormatReader::new(reader)?;
     let mut entries = Vec::new();
-    while let Some(entry) = reader.next_entry()? {
-        entries.push(entry);
+    loop {
+        match format_reader.next_record_header()? {
+            None => break,
+            Some(h) if h.record_type == RecordType::SnapshotEntry => {
+                let payload = format_reader.read_payload(h.payload_len)?;
+                let entry: Entry = rmp_serde::from_slice(&payload)?;
+                entries.push(entry);
+            }
+            Some(h) => format_reader.skip_payload(h.payload_len)?,
+        }
     }
     Ok((entries, header))
 }

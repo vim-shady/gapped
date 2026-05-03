@@ -1,8 +1,10 @@
 use crate::commands::apply::parse_diff_metadata;
+use crate::commands::diff::skip_subtree;
 use crate::commands::simulate::simulate_apply;
 use crate::commands::snapshot::load_snapshot;
 use crate::error::{GappedError, Result};
-use crate::fs::walk::{compute_dir_hashes, walk_filesystem};
+use crate::fs::hash::compute_dir_hashes;
+use crate::fs::walk::walk_filesystem;
 use crate::model::entry::{Entry, EntryKind};
 use crate::model::path::RelativePath;
 use crate::progress::Reporter;
@@ -110,8 +112,8 @@ fn compare_with_merkle(
                         && !implicit_dirs.contains(&sim.path)
                     {
                         let dir_path = sim.path.clone();
-                        skip_subtree_verify(&mut sim_iter, &dir_path, simulated);
-                        skip_subtree_verify(&mut tgt_iter, &dir_path, target);
+                        skip_subtree(&mut sim_iter, &dir_path, simulated);
+                        skip_subtree(&mut tgt_iter, &dir_path, target);
                     } else {
                         compare_single_entry(sim, tgt, implicit_dirs, &mut discrepancies);
                         sim_iter.next();
@@ -138,23 +140,6 @@ fn compare_with_merkle(
     }
 
     discrepancies
-}
-
-fn skip_subtree_verify<'a, I>(
-    iter: &mut std::iter::Peekable<I>,
-    dir_path: &RelativePath,
-    entries: &[Entry],
-) where
-    I: Iterator<Item = (usize, &'a Entry)>,
-{
-    iter.next();
-    while let Some(&(idx, _)) = iter.peek() {
-        if dir_path.contains(&entries[idx].path) {
-            iter.next();
-        } else {
-            break;
-        }
-    }
 }
 
 fn compare_single_entry(

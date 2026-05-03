@@ -1,11 +1,3 @@
-//! CLI progress reporting.
-//!
-//! A single [`Reporter`] is created once per invocation in `main`, passed down
-//! to each command, and used to spawn [`ProgressBar`]s for individual phases.
-//! When stderr is not a TTY (pipes, CI, redirection), the underlying
-//! `MultiProgress` draws to a hidden target — every `spinner`/`counter` call
-//! silently becomes a no-op.
-
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::borrow::Cow;
 use std::io::IsTerminal;

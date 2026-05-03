@@ -1,7 +1,7 @@
 use crate::error::{GappedError, Result};
 use crate::format::header::{FileHeader, RecordType};
 use crate::format::reader::FormatReader;
-use crate::model::diff::{Change, ChangeKind, Diff};
+use crate::model::diff::{Change, ChangeKind};
 use crate::model::entry::{EntryKind, Metadata};
 use crate::model::path::RelativePath;
 use crate::progress::Reporter;
@@ -69,11 +69,11 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path], reporter: &Reporter) -> 
 }
 
 fn check_diff_version(header: &FileHeader) -> Result<()> {
-    if header.file_type == "diff" && header.version != Diff::CURRENT_VERSION {
+    if header.file_type == "diff" && header.version != FileHeader::DIFF_VERSION {
         return Err(GappedError::InvalidFormat(format!(
             "unsupported diff schema version {} (expected {}); regenerate with current gapped",
             header.version,
-            Diff::CURRENT_VERSION,
+            FileHeader::DIFF_VERSION,
         )));
     }
     Ok(())
