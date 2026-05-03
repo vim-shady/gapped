@@ -1,4 +1,3 @@
-use crate::helper::{TestFixture, create_file, run_gapped};
 use std::fs::{remove_dir_all, remove_file};
 use std::os::unix::fs::symlink;
 use std::time::Duration;
@@ -6,6 +5,7 @@ use std::{fs, thread};
 
 #[path = "helper.rs"]
 mod helper;
+use helper::{TestFixture, create_file, run_gapped};
 
 #[test]
 fn test_roundtrip() {

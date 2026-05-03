@@ -9,7 +9,7 @@ pub fn copy_tree(src: &Path, dst: &Path) {
 
     fn set_mtime_from(path: &Path, src_meta: &fs::Metadata) {
         let atime = TimeSpec::UTIME_OMIT;
-        let mtime = TimeSpec::new(src_meta.mtime(), src_meta.mtime_nsec() as i64);
+        let mtime = TimeSpec::new(src_meta.mtime(), src_meta.mtime_nsec());
         nix::sys::stat::utimensat(None, path, &atime, &mtime, UtimensatFlags::NoFollowSymlink)
             .unwrap();
     }

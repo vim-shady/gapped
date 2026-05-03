@@ -1,5 +1,3 @@
-use crate::model::diff::Diff;
-use crate::model::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -73,10 +71,13 @@ fn now_unix_secs() -> i64 {
 }
 
 impl FileHeader {
+    pub const SNAPSHOT_VERSION: u32 = 2;
+    pub const DIFF_VERSION: u32 = 2;
+
     pub fn snapshot(root_dir: &Path) -> Self {
         Self {
             file_type: "snapshot".to_string(),
-            version: Snapshot::CURRENT_VERSION,
+            version: Self::SNAPSHOT_VERSION,
             created_at: now_unix_secs(),
             source_snapshot_hash: None,
             root_dir: Some(root_dir.to_string_lossy().into_owned()),
@@ -87,7 +88,7 @@ impl FileHeader {
     pub fn diff(source_snapshot_hash: [u8; 16], chunk_index: Option<u32>) -> Self {
         Self {
             file_type: "diff".to_string(),
-            version: Diff::CURRENT_VERSION,
+            version: Self::DIFF_VERSION,
             created_at: now_unix_secs(),
             source_snapshot_hash: Some(source_snapshot_hash),
             root_dir: None,

@@ -37,29 +37,21 @@ impl<W: Write> WriterInner<W> {
 }
 
 impl<W: Write> FormatWriter<W> {
-
-    /// Create a FormatWriter, optionally compressed
     pub fn maybe_compressed(inner: W, header: &FileHeader, compress: bool) -> Result<Self> {
-        Self::new_impl(inner, header, compress)
-    }
-
-    fn new_impl(mut inner: W, header: &FileHeader, compress: bool) -> Result<Self> {
         let mut hasher = Xxh3::new();
 
-        // Write magic bytes (uncompressed, so readers can detect format)
         let magic = if compress { MAGIC_COMPRESSED } else { MAGIC };
-        inner.write_all(magic)?;
+        let mut raw_inner = inner;
+        raw_inner.write_all(magic)?;
         hasher.update(magic);
 
-        // Write with compression
         let mut writer_inner = if compress {
-            let encoder = zstd::stream::write::Encoder::new(inner, 3)?;
+            let encoder = zstd::stream::write::Encoder::new(raw_inner, 3)?;
             WriterInner::Compressed(encoder)
         } else {
-            WriterInner::Plain(inner)
+            WriterInner::Plain(raw_inner)
         };
 
-        // Serialize and write header
         let header_bytes = rmp_serde::to_vec(header)?;
         let header_len = (header_bytes.len() as u32).to_le_bytes();
         writer_inner.write_all(&header_len)?;
@@ -76,36 +68,31 @@ impl<W: Write> FormatWriter<W> {
         })
     }
 
-    /// Write a snapshot entry record.
-    pub fn write_snapshot_entry(&mut self, entry: &Entry) -> Result<()> {
-        let payload = rmp_serde::to_vec(entry)?;
-        self.write_record(RecordType::SnapshotEntry, &payload)?;
+    fn hashed_write(&mut self, buf: &[u8]) -> Result<()> {
+        self.inner.write_all(buf)?;
+        self.hasher.update(buf);
+        self.bytes_written += buf.len() as u64;
         Ok(())
     }
 
-    /// Write a diff change record.
+    pub fn write_snapshot_entry(&mut self, entry: &Entry) -> Result<()> {
+        let payload = rmp_serde::to_vec(entry)?;
+        self.write_record(RecordType::SnapshotEntry, &payload)
+    }
+
     pub fn write_diff_change(&mut self, change: &Change) -> Result<()> {
         let payload = rmp_serde::to_vec(change)?;
-        self.write_record(RecordType::DiffChange, &payload)?;
-        Ok(())
+        self.write_record(RecordType::DiffChange, &payload)
     }
 
     /// Stream a `FileContent` record of exactly `size` bytes from `reader`.
-    /// Lets the caller hand bytes to the encoder + rolling hash without ever
-    /// materializing the whole payload in memory.
     pub fn write_file_content_from_reader<R: Read>(
         &mut self,
         reader: &mut R,
         size: u64,
     ) -> Result<()> {
-        let len_bytes = size.to_le_bytes();
-        let type_byte = [RecordType::FileContent as u8];
-
-        self.inner.write_all(&len_bytes)?;
-        self.hasher.update(&len_bytes);
-        self.inner.write_all(&type_byte)?;
-        self.hasher.update(&type_byte);
-        self.bytes_written += 9;
+        self.hashed_write(&size.to_le_bytes())?;
+        self.hashed_write(&[RecordType::FileContent as u8])?;
 
         let mut buf = [0u8; STREAM_BUF];
         let mut remaining = size;
@@ -118,15 +105,12 @@ impl<W: Write> FormatWriter<W> {
                     format!("FileContent short by {} bytes", remaining),
                 )));
             }
-            self.inner.write_all(&buf[..n])?;
-            self.hasher.update(&buf[..n]);
-            self.bytes_written += n as u64;
+            self.hashed_write(&buf[..n])?;
             remaining -= n as u64;
         }
         Ok(())
     }
 
-    /// Finalize the file by writing EOR marker and checksum
     pub fn finish(mut self) -> Result<W> {
         self.inner.write_all(&EOR)?;
         self.hasher.update(&EOR);
@@ -135,35 +119,18 @@ impl<W: Write> FormatWriter<W> {
         self.inner.write_all(&hash)?;
         self.inner.flush()?;
 
-        // Finish compression
         match self.inner {
             WriterInner::Plain(writer) => Ok(writer),
-            WriterInner::Compressed(encoder) => {
-                let writer = encoder.finish()?;
-                Ok(writer)
-            }
+            WriterInner::Compressed(encoder) => Ok(encoder.finish()?),
         }
     }
 
-    /// Write a single record
     fn write_record(&mut self, record_type: RecordType, payload: &[u8]) -> Result<()> {
-        let len_bytes = (payload.len() as u64).to_le_bytes();
-        let type_byte = [record_type as u8];
-
-        self.inner.write_all(&len_bytes)?;
-        self.hasher.update(&len_bytes);
-        self.inner.write_all(&type_byte)?;
-        self.hasher.update(&type_byte);
-        self.bytes_written += 9;
-
-        self.inner.write_all(payload)?;
-        self.hasher.update(payload);
-        self.bytes_written += payload.len() as u64;
-
-        Ok(())
+        self.hashed_write(&(payload.len() as u64).to_le_bytes())?;
+        self.hashed_write(&[record_type as u8])?;
+        self.hashed_write(payload)
     }
 
-    /// Get approximate number of bytes written
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
     }

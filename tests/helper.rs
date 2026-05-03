@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,6 +11,7 @@ pub struct TestFixture {
     pub working_dir: TempDir,
 }
 
+// Kept for regression - usage in `roundtrip_test.rs`
 impl TestFixture {
     pub fn new() -> Self {
         TestFixture {

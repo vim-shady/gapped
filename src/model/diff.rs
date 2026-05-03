@@ -3,20 +3,6 @@ use crate::model::path::RelativePath;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Diff representing all changes between source and target
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Diff {
-    pub version: u32,
-    pub created_at: i64,
-    /// Hash of input snapshot (for integrity check)
-    pub source_snapshot_hash: [u8; 16],
-    pub changes: Vec<Change>,
-}
-
-impl Diff {
-    pub const CURRENT_VERSION: u32 = 2;
-}
-
 /// Single change in the diff
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Change {

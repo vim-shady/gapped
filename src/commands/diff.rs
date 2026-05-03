@@ -1,21 +1,19 @@
-use crate::commands::snapshot::SnapshotReader;
+use crate::commands::snapshot::load_snapshot;
 use crate::error::{GappedError, Result};
 use crate::format::header::{FileHeader, RECORD_HEADER_SIZE};
 use crate::format::writer::FormatWriter;
-use crate::fs::walk::{WalkItem, WalkStats, WalkStream};
+use crate::fs::hash::compute_dir_hashes;
+use crate::fs::walk::walk_filesystem;
 use crate::model::diff::{AddedEntry, Change, ChangeKind, ModifiedEntry};
 use crate::model::entry::{Entry, EntryKind};
-use crate::parallel::{self, Chunk, ContentReader};
+use crate::model::path::RelativePath;
+use crate::parallel::{ContentReader, PrefetchPool};
 use crate::progress::Reporter;
-use crossbeam_channel::{Receiver, Sender};
 use log::info;
-#[cfg(test)]
 use std::cmp::Ordering;
-use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
 
 pub fn run_diff(
     root_dir: &Path,
@@ -37,25 +35,30 @@ pub fn run_diff(
         })?;
     hash_pb.finish_and_clear();
 
-    // streaming merge-join
-    info!("Opening input snapshot {}", snapshot_in.display());
-    let (prev_reader, _old_header) = SnapshotReader::open(snapshot_in)?;
+    info!("Loading old snapshot {}", snapshot_in.display());
+    let load_pb = reporter.spinner("Loading old snapshot");
+    let (old_entries, _) = load_snapshot(snapshot_in)?;
+    load_pb.finish_with_message(format!("Loaded {} entries", old_entries.len()));
 
+    info!("Walking filesystem under {}", root_dir.display());
+    let (mut new_entries, walk_stats) = walk_filesystem(&root_dir, Some(&old_entries), reporter)?;
+
+    info!("Computing directory hashes");
+    compute_dir_hashes(&mut new_entries);
+
+    let snapshot_pb = reporter.spinner("Writing new snapshot");
     let snap_file = File::create(snapshot_out)?;
     let snap_buf = BufWriter::new(snap_file);
     let snap_header = FileHeader::snapshot(&root_dir);
     let mut snap_writer = FormatWriter::maybe_compressed(snap_buf, &snap_header, compress)?;
-    let snapshot_pb = reporter.spinner("Writing new snapshot");
-
-    info!("Walking filesystem under {}", root_dir.display());
-    let walk_stream = WalkStream::new(&root_dir, Some(prev_reader), reporter);
-    let result = compute_changes(walk_stream, &mut snap_writer)?;
-
+    for entry in &new_entries {
+        snap_writer.write_snapshot_entry(entry)?;
+    }
     snap_writer.finish()?;
-    snapshot_pb.finish_with_message(format!(
-        "Wrote {} snapshot entries",
-        result.snapshot_entries
-    ));
+    snapshot_pb.finish_with_message(format!("Wrote {} snapshot entries", new_entries.len()));
+
+    info!("Computing diff with Merkle optimization");
+    let result = compute_diff_merkle(&old_entries, &new_entries)?;
 
     if let Some(max_bytes) = split_size {
         write_split_diff(
@@ -82,9 +85,10 @@ pub fn run_diff(
     eprintln!("  Added: {}", result.added);
     eprintln!("  Modified: {}", result.modified);
     eprintln!("  Deleted: {}", result.removed);
+    eprintln!("  Skipped (Merkle): {}", result.skipped);
     eprintln!("  Total changes: {}", result.changes.len());
-    if result.stats.errors > 0 {
-        eprintln!("  Walk errors: {}", result.stats.errors);
+    if walk_stats.errors > 0 {
+        eprintln!("  Walk errors: {}", walk_stats.errors);
     }
 
     Ok(())
@@ -95,45 +99,70 @@ struct DiffResult {
     added: usize,
     modified: usize,
     removed: usize,
-    snapshot_entries: u64,
-    stats: WalkStats,
+    skipped: usize,
 }
 
-/// Consume a `WalkStream`, classify each item as a `Change`, and write new
-/// entries to the snapshot on the fly.
-fn compute_changes<W: Write>(
-    mut walk: WalkStream<'_>,
-    snap_writer: &mut FormatWriter<W>,
-) -> Result<DiffResult> {
+/// Merge-join old and new entries with Merkle short-circuiting.
+///
+/// When both sides have a directory with matching `dir_hash`, the entire
+/// subtree is skipped — no changes are emitted for anything under that
+/// directory.
+fn compute_diff_merkle(old_entries: &[Entry], new_entries: &[Entry]) -> Result<DiffResult> {
     let mut changes = Vec::new();
-    let (mut added, mut modified, mut removed) = (0, 0, 0);
-    let mut snapshot_entries: u64 = 0;
+    let (mut added, mut modified, mut removed, mut skipped) = (0, 0, 0, 0);
+    let mut old_iter = old_entries.iter().enumerate().peekable();
+    let mut new_iter = new_entries.iter().enumerate().peekable();
 
-    for item in walk.by_ref() {
-        match item? {
-            WalkItem::Added(new) => {
-                snap_writer.write_snapshot_entry(&new)?;
-                snapshot_entries += 1;
-                changes.push(build_added_change(&new));
-                added += 1;
-            }
-            WalkItem::Both { new, old } => {
-                snap_writer.write_snapshot_entry(&new)?;
-                snapshot_entries += 1;
-                if new.kind != old.kind {
-                    changes.push(build_removed_change(&old));
-                    changes.push(build_added_change(&new));
+    loop {
+        match (old_iter.peek(), new_iter.peek()) {
+            (Some((_, old)), Some((_, new))) => match old.path.cmp(&new.path) {
+                Ordering::Less => {
+                    changes.push(build_removed_change(old));
                     removed += 1;
-                    added += 1;
-                } else if let Some(change) = compute_entry_diff(&old, &new) {
-                    changes.push(change);
-                    modified += 1;
+                    old_iter.next();
                 }
-            }
-            WalkItem::Removed(old) => {
-                changes.push(build_removed_change(&old));
+                Ordering::Greater => {
+                    changes.push(build_added_change(new));
+                    added += 1;
+                    new_iter.next();
+                }
+                Ordering::Equal => {
+                    if old.kind == EntryKind::Directory
+                        && new.kind == EntryKind::Directory
+                        && old.dir_hash.is_some()
+                        && old.dir_hash == new.dir_hash
+                    {
+                        let dir_path = &old.path;
+                        skip_subtree(&mut old_iter, dir_path, old_entries);
+                        skipped += skip_subtree(&mut new_iter, dir_path, new_entries);
+                    } else if old.kind != new.kind {
+                        changes.push(build_removed_change(old));
+                        changes.push(build_added_change(new));
+                        removed += 1;
+                        added += 1;
+                        old_iter.next();
+                        new_iter.next();
+                    } else {
+                        if let Some(change) = compute_entry_diff(old, new) {
+                            changes.push(change);
+                            modified += 1;
+                        }
+                        old_iter.next();
+                        new_iter.next();
+                    }
+                }
+            },
+            (Some((_, old)), None) => {
+                changes.push(build_removed_change(old));
                 removed += 1;
+                old_iter.next();
             }
+            (None, Some((_, new))) => {
+                changes.push(build_added_change(new));
+                added += 1;
+                new_iter.next();
+            }
+            (None, None) => break,
         }
     }
 
@@ -142,8 +171,67 @@ fn compute_changes<W: Write>(
         added,
         modified,
         removed,
-        snapshot_entries,
-        stats: walk.into_stats(),
+        skipped,
+    })
+}
+
+/// Advance a peekable iterator past all entries under `dir_path`, including
+/// the directory entry itself. Returns the count of skipped entries.
+pub fn skip_subtree<'a, I>(
+    iter: &mut std::iter::Peekable<I>,
+    dir_path: &RelativePath,
+    entries: &[Entry],
+) -> usize
+where
+    I: Iterator<Item = (usize, &'a Entry)>,
+{
+    let mut count = 0;
+    iter.next();
+    count += 1;
+    while let Some(&(idx, _)) = iter.peek() {
+        if dir_path.contains(&entries[idx].path) {
+            iter.next();
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Compare two entries of the same kind and produce a change if they differ
+fn compute_entry_diff(old: &Entry, new: &Entry) -> Option<Change> {
+    debug_assert!(old.kind == new.kind);
+
+    let metadata_changed = !old.metadata.matches(&new.metadata);
+    let hash_changed = old.hash != new.hash;
+    let symlink_target_changed = old.symlink_target != new.symlink_target;
+
+    if !metadata_changed && !hash_changed && !symlink_target_changed {
+        return None;
+    }
+
+    let has_content = hash_changed && new.kind == EntryKind::File;
+    let modified = ModifiedEntry {
+        // always carry new_metadata when content changes — the apply reader
+        // needs size to pair FileContent bytes with this change
+        new_metadata: if metadata_changed || has_content {
+            Some(new.metadata.clone())
+        } else {
+            None
+        },
+        new_hash: if hash_changed { new.hash } else { None },
+        has_content,
+        new_symlink_target: if symlink_target_changed {
+            new.symlink_target.clone()
+        } else {
+            None
+        },
+    };
+
+    Some(Change {
+        path: new.path.clone(),
+        kind: ChangeKind::Modified(modified),
     })
 }
 
@@ -339,208 +427,6 @@ fn write_content_fragment<W: Write>(
     Ok(())
 }
 
-/// A job dispatched to a prefetch worker.
-struct ReadJob {
-    path: PathBuf,
-    size_tx: Sender<io::Result<u64>>,
-    chunk_tx: Sender<Chunk>,
-}
-
-/// One file queued for prefetching. `size_rx` resolves to the file
-/// size (or an open error). `chunk_rx` streams the payload afterward.
-struct Pending {
-    path: PathBuf,
-    size_rx: Receiver<io::Result<u64>>,
-    chunk_rx: Receiver<Chunk>,
-}
-
-/// Prefetches file content in parallel, handing out `ContentReader`s in
-/// change-list order. At most `n_workers` files are streamed concurrently,
-/// each bounded to `CHUNK_DEPTH` buffered chunks
-struct PrefetchPool {
-    paths: Vec<PathBuf>,
-    in_flight: VecDeque<Pending>,
-    next_spawn: usize,
-    max_in_flight: usize,
-    job_tx: Option<Sender<ReadJob>>,
-    handles: Vec<thread::JoinHandle<()>>,
-}
-
-impl PrefetchPool {
-    fn new(paths: Vec<PathBuf>) -> Self {
-        let n_workers = parallel::worker_count();
-        let (job_tx, job_rx) = crossbeam_channel::bounded::<ReadJob>(n_workers);
-
-        let handles: Vec<_> = (0..n_workers)
-            .map(|_| {
-                let job_rx = job_rx.clone();
-                thread::spawn(move || {
-                    for job in job_rx.iter() {
-                        stream_file(job);
-                    }
-                })
-            })
-            .collect();
-        drop(job_rx);
-
-        let mut pool = Self {
-            paths,
-            in_flight: VecDeque::new(),
-            next_spawn: 0,
-            max_in_flight: n_workers,
-            job_tx: Some(job_tx),
-            handles,
-        };
-        pool.top_up();
-        pool
-    }
-
-    /// Dispatch jobs up to the concurrency cap.
-    fn top_up(&mut self) {
-        let Some(tx) = self.job_tx.as_ref() else {
-            return;
-        };
-        while self.in_flight.len() < self.max_in_flight && self.next_spawn < self.paths.len() {
-            let path = self.paths[self.next_spawn].clone();
-            self.next_spawn += 1;
-            let (size_tx, size_rx) = crossbeam_channel::bounded(1);
-            let (chunk_tx, chunk_rx) = parallel::chunk_channel();
-            if tx
-                .send(ReadJob {
-                    path: path.clone(),
-                    size_tx,
-                    chunk_tx,
-                })
-                .is_err()
-            {
-                break;
-            }
-            self.in_flight.push_back(Pending {
-                path,
-                size_rx,
-                chunk_rx,
-            });
-        }
-    }
-
-    /// Pop the next file in queue order, blocking until its size is known.
-    /// Returns `Ok(None)` once every queued path has been handed out.
-    fn next(&mut self) -> Result<Option<ContentReader>> {
-        let Some(pending) = self.in_flight.pop_front() else {
-            return Ok(None);
-        };
-        self.top_up();
-        let size = pending.size_rx.recv().map_err(|_| {
-            GappedError::WorkerPoolFailure("prefetch worker exited before reporting size")
-        })?;
-        let size = size.map_err(|source| GappedError::IoPath {
-            path: pending.path,
-            source,
-        })?;
-        Ok(Some(ContentReader::new(pending.chunk_rx, size)))
-    }
-
-    /// Close job channel and join all worker threads.
-    fn finish(mut self) -> Result<()> {
-        self.job_tx.take();
-        for handle in self.handles.drain(..) {
-            parallel::join_worker(handle, "diff reader thread panicked")?;
-        }
-        Ok(())
-    }
-}
-
-/// Open the file, report its size, then stream the payload as `CHUNK_SIZE`
-/// chunks through `chunk_tx`. Stops after exactly `size` bytes.
-fn stream_file(job: ReadJob) {
-    let ReadJob {
-        path,
-        size_tx,
-        chunk_tx,
-    } = job;
-
-    let opened = File::open(&path).and_then(|f| {
-        let size = f.metadata()?.len();
-        Ok((f, size))
-    });
-
-    let (file, size) = match opened {
-        Ok(v) => {
-            if size_tx.send(Ok(v.1)).is_err() {
-                return;
-            }
-            v
-        }
-        Err(e) => {
-            let _ = size_tx.send(Err(e));
-            return;
-        }
-    };
-
-    let mut reader = BufReader::with_capacity(parallel::CHUNK_SIZE, file);
-    let mut remaining = size;
-    while remaining > 0 {
-        let want = parallel::CHUNK_SIZE.min(remaining as usize);
-        let mut buf = vec![0u8; want];
-        match reader.read(&mut buf) {
-            Ok(0) => {
-                let _ = chunk_tx.send(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "file truncated while streaming",
-                )));
-                return;
-            }
-            Ok(n) => {
-                buf.truncate(n);
-                if chunk_tx.send(Ok(buf)).is_err() {
-                    return;
-                }
-                remaining -= n as u64;
-            }
-            Err(e) => {
-                let _ = chunk_tx.send(Err(e));
-                return;
-            }
-        }
-    }
-}
-
-/// Compare two entries of the same kind and produce a change if they differ
-fn compute_entry_diff(old: &Entry, new: &Entry) -> Option<Change> {
-    debug_assert!(old.kind == new.kind);
-
-    let metadata_changed = !old.metadata.matches(&new.metadata);
-    let hash_changed = old.hash != new.hash;
-    let symlink_target_changed = old.symlink_target != new.symlink_target;
-
-    if !metadata_changed && !hash_changed && !symlink_target_changed {
-        return None;
-    }
-
-    let has_content = hash_changed && new.kind == EntryKind::File;
-    let modified = ModifiedEntry {
-        // Always carry new_metadata when content changes — the apply reader
-        // needs size to pair FileContent bytes with this change
-        new_metadata: if metadata_changed || has_content {
-            Some(new.metadata.clone())
-        } else {
-            None
-        },
-        new_hash: if hash_changed { new.hash } else { None },
-        has_content,
-        new_symlink_target: if symlink_target_changed {
-            new.symlink_target.clone()
-        } else {
-            None
-        },
-    };
-
-    Some(Change {
-        path: new.path.clone(),
-        kind: ChangeKind::Modified(modified),
-    })
-}
-
 fn build_removed_change(entry: &Entry) -> Change {
     Change {
         path: entry.path.clone(),
@@ -558,54 +444,9 @@ fn build_added_change(entry: &Entry) -> Change {
     }
 }
 
-/// Reference merge-join used only by the unit tests. this function exists to keep the
-/// test suite able to exercise the merge logic on small
-/// snapshots without needing a real filesystem walk.
 #[cfg(test)]
-fn compute_diff(
-    old_entries: &[Entry],
-    new_entries: &[Entry],
-    _root_dir: &Path,
-) -> Result<Vec<Change>> {
-    let mut diff = Vec::new();
-    let mut old_iter = old_entries.iter().peekable();
-    let mut new_iter = new_entries.iter().peekable();
-
-    loop {
-        match (old_iter.peek(), new_iter.peek()) {
-            (Some(old), Some(new)) => match old.path.cmp(&new.path) {
-                Ordering::Less => {
-                    diff.push(build_removed_change(old));
-                    old_iter.next();
-                }
-                Ordering::Greater => {
-                    diff.push(build_added_change(new));
-                    new_iter.next();
-                }
-                Ordering::Equal => {
-                    if old.kind != new.kind {
-                        diff.push(build_removed_change(old));
-                        diff.push(build_added_change(new));
-                    } else if let Some(change) = compute_entry_diff(old, new) {
-                        diff.push(change);
-                    }
-                    old_iter.next();
-                    new_iter.next();
-                }
-            },
-            (Some(old), None) => {
-                diff.push(build_removed_change(old));
-                old_iter.next();
-            }
-            (None, Some(new)) => {
-                diff.push(build_added_change(new));
-                new_iter.next();
-            }
-            (None, None) => break,
-        }
-    }
-
-    Ok(diff)
+fn compute_diff(old_entries: &[Entry], new_entries: &[Entry]) -> Result<Vec<Change>> {
+    Ok(compute_diff_merkle(old_entries, new_entries)?.changes)
 }
 
 #[cfg(test)]
@@ -614,6 +455,7 @@ mod tests {
     use crate::model::entry::{Entry, EntryKind, Metadata};
     use crate::model::path::RelativePath;
     use std::path::PathBuf;
+    use std::thread;
 
     fn make_metadata(size: u64, mtime_sec: i64, permissions: u32) -> Metadata {
         Metadata {
@@ -633,6 +475,7 @@ mod tests {
             metadata: make_metadata(size, mtime_sec, 0o644),
             hash,
             symlink_target: None,
+            dir_hash: None,
         }
     }
 
@@ -643,6 +486,7 @@ mod tests {
             metadata: make_metadata(0, mtime, 0o755),
             hash: None,
             symlink_target: None,
+            dir_hash: None,
         }
     }
 
@@ -653,6 +497,7 @@ mod tests {
             metadata: make_metadata(0, 0, 0o777),
             hash: None,
             symlink_target: Some(PathBuf::from(target)),
+            dir_hash: None,
         }
     }
 
@@ -683,8 +528,7 @@ mod tests {
             make_file(Path::new("sub/b.txt"), 200, 1000, Some(dummy_hash(2))),
         ];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&entries, &entries, &root).unwrap();
+        let changes = compute_diff(&entries, &entries).unwrap();
         assert!(
             changes.is_empty(),
             "Identical snapshots should produce no changes"
@@ -699,8 +543,7 @@ mod tests {
             make_file(Path::new("hello.txt"), 5, 1000, Some(dummy_hash(1))),
         ];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 2);
         assert!(
@@ -718,8 +561,7 @@ mod tests {
         ];
         let new: Vec<Entry> = vec![];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 2);
         assert!(
@@ -741,8 +583,7 @@ mod tests {
             make_file(Path::new("b.txt"), 20, 2000, Some(dummy_hash(2))),
         ];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 1);
         assert_eq!(
@@ -769,8 +610,7 @@ mod tests {
             make_file(Path::new("a.txt"), 10, 1000, Some(dummy_hash(1))),
         ];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 1);
         assert_eq!(
@@ -798,8 +638,7 @@ mod tests {
             Some(dummy_hash(2)),
         )];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
@@ -829,8 +668,7 @@ mod tests {
             Some(dummy_hash(1)),
         )]; // same hash, diff mtime
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
@@ -856,8 +694,7 @@ mod tests {
         let mut new_entry = make_file(Path::new("script.sh"), 50, 1000, Some(dummy_hash(1)));
         new_entry.metadata.permissions = 0o755;
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&[old_entry], &[new_entry], &root).unwrap();
+        let changes = compute_diff(&[old_entry], &[new_entry]).unwrap();
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
@@ -876,8 +713,7 @@ mod tests {
         let old = vec![make_symlink(Path::new("link"), "/old/target")];
         let new = vec![make_symlink(Path::new("link"), "/new/target")];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
@@ -901,8 +737,7 @@ mod tests {
         )];
         let new = vec![make_dir(Path::new("thing"), 2000)];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         // Type change should produce a Remove (old type) then Add (new type)
         assert_eq!(changes.len(), 2);
@@ -919,8 +754,7 @@ mod tests {
         let old = vec![make_dir(Path::new("thing"), 1000)];
         let new = vec![make_symlink(Path::new("thing"), "/somewhere")];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 2);
         assert!(matches!(
@@ -935,8 +769,7 @@ mod tests {
         let old = vec![make_symlink(Path::new("thing"), "/target")];
         let new = vec![make_file(Path::new("thing"), 50, 2000, Some(dummy_hash(1)))];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 2);
         assert!(matches!(
@@ -964,8 +797,7 @@ mod tests {
             make_file(Path::new("d.txt"), 40, 3000, Some(dummy_hash(5))), // added
         ];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         let summary = summarize(&changes);
         assert_eq!(summary.len(), 3);
@@ -1000,8 +832,7 @@ mod tests {
         new_entry.metadata.uid = 0;
         new_entry.metadata.gid = 0;
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&[old_entry], &[new_entry], &root).unwrap();
+        let changes = compute_diff(&[old_entry], &[new_entry]).unwrap();
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
@@ -1020,8 +851,7 @@ mod tests {
         let old = vec![make_dir(Path::new("mydir"), 1000)];
         let new = vec![make_dir(Path::new("mydir"), 2000)];
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 1);
         if let ChangeKind::Modified(ref m) = changes[0].kind {
@@ -1335,8 +1165,7 @@ mod tests {
         // Modify file 999 (metadata only)
         new[999].metadata.permissions = 0o600;
 
-        let root = PathBuf::from("/dummy");
-        let changes = compute_diff(&old, &new, &root).unwrap();
+        let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 2);
 
