@@ -33,7 +33,7 @@ pub fn run_verify(
     ));
 
     info!("Walk filesystem at {}", root_dir.display());
-    let (current_entries_vec, _) = walk_filesystem(&root_dir, None, reporter)?;
+    let (current_entries_vec, _) = walk_filesystem(&root_dir, Some(&target_entries), reporter)?;
 
     let mut simulated: HashMap<RelativePath, Entry> = current_entries_vec
         .into_iter()
