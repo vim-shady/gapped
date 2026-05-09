@@ -13,6 +13,7 @@ Offline file synchronizer for air-gapped systems.
 - **Split diffs** — large diffs can be split into size-limited chunks for transport on capacity-constrained media
 - **Integrity verification** — every file includes an XXH3-128 checksum; a dedicated `verify` command simulates apply without writing
 - **Full metadata preservation** — permissions, ownership (uid/gid), modification times, and symlink targets
+- **Merkle tree optimized calculation** - `diff` and `verify` commands use Merkle trees to shortcircuit calculation
 
 ## Installation
 
@@ -41,38 +42,38 @@ cp target/release/gapped ~/.local/bin/
 Capture the current state of the directory you want to synchronize:
 
 ```bash
-gapped snapshot /src/data snapshot_v1.gapped
+gapped snapshot /src/data snap.gapped
 ```
 
-Transfer `snapshot_v1.gapped` to the target machine and apply it there as the baseline (the very first sync requires a full copy via rsync or similar — the snapshot alone contains no file content).
+Transfer `snap.gapped` to the target machine and apply it there as the baseline (the very first sync requires a full copy via rsync or similar — the snapshot alone contains no file content).
 
 ### 2. Compute a diff (source machine)
 
 After files have changed, compute the differences against the previous snapshot:
 
 ```bash
-gapped diff /src/data snapshot_v1.gapped diff_v2.gapped snapshot_v2.gapped
+gapped diff /src/data snap.gapped diff.gapped snap_v2.gapped
 ```
 
-This reads the current filesystem, compares it to `snapshot_v1.gapped`, and produces:
-- `diff_v2.gapped` — the diff containing all changes and new file content
-- `snapshot_v2.gapped` — an updated snapshot of the current state (used as input for the next diff)
+This reads the current filesystem, compares it to `snap.gapped`, and produces:
+- `diff.gapped` — the diff containing all changes and new file content
+- `snap_v2.gapped` — an updated snapshot of the current state (used as input for the next diff)
 
 #### Options
 
 Compress the output:
 
 ```bash
-gapped diff /src/data snapshot_v1.gapped diff_v2.gapped snapshot_v2.gapped --compress
+gapped diff /src/data snap.gapped diff.gapped snap_v2.gapped --compress
 ```
 
 Split the diff into chunks (useful when transporting on size-limited media):
 
 ```bash
-gapped diff /src/data snapshot_v1.gapped diff_v2.gapped snapshot_v2.gapped --split-size 4GB
+gapped diff /src/data snap.gapped diff.gapped snap_v2.gapped --split-size 4GB
 ```
 
-This produces `diff_v2_001.gapped`, `diff_v2_002.gapped`, etc. The `--split-size` flag accepts values like `100MB`, `500KB`, `2GB`, or a raw byte count.
+This produces `diff_001.gapped`, `diff_002.gapped`, etc. The `--split-size` flag accepts values like `100MB`, `500KB`, `2GB`, or a raw byte count.
 
 ### 3. Transfer
 
@@ -81,13 +82,13 @@ Copy the diff file(s) to the target machine using whatever physical medium is av
 ### 4. Apply the diff (target machine)
 
 ```bash
-gapped apply /target/data diff_v2.gapped
+gapped apply /target/data diff.gapped
 ```
 
 If the diff was split, pass any chunk — `gapped` auto-detects and applies all parts in order:
 
 ```bash
-gapped apply /target/data diff_v2_001.gapped
+gapped apply /target/data diff_001.gapped
 ```
 
 ### Verify before applying
@@ -95,7 +96,7 @@ gapped apply /target/data diff_v2_001.gapped
 Simulate the apply and compare the result against the expected snapshot, without modifying the filesystem:
 
 ```bash
-gapped verify /target/data diff_v2.gapped snapshot_v2.gapped
+gapped verify /target/data diff.gapped snap_v2.gapped
 ```
 
 ### Incremental snapshots
@@ -103,7 +104,7 @@ gapped verify /target/data diff_v2.gapped snapshot_v2.gapped
 When creating a new snapshot, pass the previous snapshot to reuse cached hashes for unchanged files:
 
 ```bash
-gapped snapshot /src/data snapshot_v2.gapped snapshot_v1.gapped
+gapped snapshot /src/data snap_v2.gapped snap.gapped
 ```
 
 
@@ -112,8 +113,8 @@ gapped snapshot /src/data snapshot_v2.gapped snapshot_v1.gapped
 Control log verbosity with the `RUST_LOG` environment variable:
 
 ```bash
-RUST_LOG=info gapped diff /srv/data s1.gapped d2.gapped s2.gapped
-RUST_LOG=debug gapped apply /srv/data d2.gapped
+RUST_LOG=info gapped diff /srv/data snap1.gapped diff.gapped snap2.gapped
+RUST_LOG=debug gapped apply /srv/data diff.gapped
 ```
 
 Progress bars are shown when stderr is a terminal and hidden otherwise.
