@@ -20,7 +20,7 @@ pub enum EntryKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
     pub size: u64,
-    // negative values are actually used for timestamps that date before 1970 :)
+    // Negative values represent timestamps before 1970.
     pub mtime_sec: i64,
     pub mtime_nsec: u32,
     pub permissions: u32,
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn mtime_matches_across_negative_timestamps() {
-        // pre 1970 timestamps should also work (negative mtime_sec
+        // pre-1970 timestamps should also work (negative mtime_sec)
         let a = create_meta(-10, 500_000_000);
         let b = create_meta(-9, 500_000_000);
         assert!(a.matches(&b));

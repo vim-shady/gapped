@@ -34,7 +34,6 @@ struct StreamResult {
 pub fn run_apply(root_dir: &Path, diff_files: &[&Path], reporter: &Reporter) -> Result<()> {
     let root_dir = super::validate_root_dir(root_dir)?;
 
-    // collect metadata, apply deletions and non-content changes
     let parse_pb = reporter.spinner("Reading diff metadata");
     let changes = parse_diff_metadata(diff_files)?;
     parse_pb.finish_with_message(format!("Read {} changes from diff", changes.len()));
@@ -45,7 +44,6 @@ pub fn run_apply(root_dir: &Path, diff_files: &[&Path], reporter: &Reporter) -> 
     let first_pass = apply_non_content_changes(&changes, &root_dir, reporter);
     err_count += first_pass.err_count;
 
-    // stream file content directly to disk
     let second_pass = stream_file_contents(diff_files, &root_dir, &changes, reporter)?;
     err_count += second_pass.err_count;
 
@@ -484,7 +482,7 @@ fn set_mtime(path: &Path, mtime_sec: i64, mtime_nsec: u32) {
     use nix::sys::stat::UtimensatFlags;
     use nix::sys::time::TimeSpec;
 
-    let atime = TimeSpec::UTIME_OMIT; // leave unchanged
+    let atime = TimeSpec::UTIME_OMIT;
     let mtime = TimeSpec::new(mtime_sec, mtime_nsec as i64);
 
     if let Err(e) =
@@ -512,7 +510,7 @@ fn set_symlink_ownership(path: &Path, metadata: &Metadata) {
 }
 
 /// Detect diff files: given a path like "diff.gapped", look for
-/// "diff.gapped.001, "diff.gapped.002", etc.
+/// "diff.gapped.001", "diff.gapped.002", etc.
 pub fn detect_diff_files(diff_path: &Path) -> Result<Vec<PathBuf>> {
     let path_str = diff_path.to_string_lossy();
 
@@ -595,7 +593,6 @@ mod tests {
         assert!(result.is_err(), "should error on gap in chunk sequence");
     }
 
-    // E2E: snapshot → diff with split_size → apply the detected chunks
     #[test]
     fn test_run_apply_from_split_chunks() {
         let tmp = TempDir::new().unwrap();

@@ -36,7 +36,6 @@ pub fn run_snapshot(
         None
     };
 
-    // Walk the file system
     info!("Walking filesystem under {}", root_dir.display());
     let (mut entries, stats) = walk_filesystem(&root_dir, previous_entries.as_deref(), reporter)?;
 
@@ -60,7 +59,6 @@ pub fn run_snapshot(
 
     writer.finish()?;
 
-    // Report statistics
     eprintln!("Snapshot complete:");
     eprintln!("  Total entries: {}", stats.total_entries);
     eprintln!("  Directories: {}", stats.directories);

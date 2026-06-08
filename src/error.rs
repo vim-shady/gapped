@@ -30,7 +30,7 @@ pub enum GappedError {
     #[error("Root directory does not exist: {0}")]
     RootNotFound(PathBuf),
 
-    #[error("Verification failed: {0} discrepancies found ")]
+    #[error("Verification failed: {0} discrepancies found")]
     VerificationFailed(usize),
 
     #[error("Walk error: {0}")]

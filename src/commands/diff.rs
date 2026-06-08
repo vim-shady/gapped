@@ -592,7 +592,6 @@ mod tests {
         );
         assert!(matches!(changes[0].kind, ChangeKind::Added(_)));
 
-        // Added file should have has_content = true
         if let ChangeKind::Added(ref added) = changes[0].kind {
             assert!(added.has_content, "Added file should have content");
         }
@@ -739,7 +738,6 @@ mod tests {
 
         let changes = compute_diff(&old, &new).unwrap();
 
-        // Type change should produce a Remove (old type) then Add (new type)
         assert_eq!(changes.len(), 2);
         assert!(matches!(
             changes[0].kind,
@@ -778,7 +776,6 @@ mod tests {
         ));
         assert!(matches!(changes[1].kind, ChangeKind::Added(_)));
 
-        // The added file should have content
         if let ChangeKind::Added(ref added) = changes[1].kind {
             assert!(added.has_content);
         }
@@ -802,7 +799,6 @@ mod tests {
         let summary = summarize(&changes);
         assert_eq!(summary.len(), 3);
 
-        // Check each change (order follows sorted path merge-join)
         assert_eq!(
             summary[0].0,
             &RelativePath::new(Path::new("a.txt")).unwrap()
@@ -862,8 +858,6 @@ mod tests {
         }
     }
 
-    // --- Split diff writer tests ---
-
     use crate::commands::apply::detect_diff_files;
     use crate::commands::snapshot::run_snapshot;
     use crate::format::header::RecordType;
@@ -889,7 +883,7 @@ mod tests {
         total
     }
 
-    // seed source dir with files and write payloaf
+    // seed source dir with files and write payload
     fn seed_source(source: &Path, count: usize, payload: &[u8]) {
         fs::create_dir_all(source).unwrap();
         for i in 0..count {
@@ -957,7 +951,6 @@ mod tests {
         )
         .unwrap();
 
-        // base path itself should NOT exist...
         assert!(!diff_base.exists());
 
         let chunks = detect_diff_files(&diff_base).unwrap();
@@ -1110,7 +1103,7 @@ mod tests {
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
-        // mdify every file with distinct content to test the parallel
+        // modify every file with distinct content to test the parallel
         // read + in-order write path under split-chunks.
         thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..N {
@@ -1159,17 +1152,14 @@ mod tests {
             .collect();
 
         let mut new = old.clone();
-        // Modify file 42
         new[42].metadata.mtime_sec = 9999;
         new[42].hash = Some(dummy_hash(2));
-        // Modify file 999 (metadata only)
         new[999].metadata.permissions = 0o600;
 
         let changes = compute_diff(&old, &new).unwrap();
 
         assert_eq!(changes.len(), 2);
 
-        // file_0042: content changed
         assert_eq!(
             changes[0].path,
             RelativePath::new(Path::new("file_0042.txt")).unwrap()
@@ -1178,7 +1168,6 @@ mod tests {
             assert!(m.has_content);
         }
 
-        // file_0999: metadata only
         assert_eq!(
             changes[1].path,
             RelativePath::new(Path::new("file_0999.txt")).unwrap()

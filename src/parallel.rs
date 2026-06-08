@@ -27,7 +27,7 @@ pub fn worker_count() -> usize {
         .min(MAX_WORKERS)
 }
 
-/// Create a bounded chunk channel with pipelines standard depth.
+/// Create a bounded chunk channel with the pipeline's standard depth.
 pub fn chunk_channel() -> (Sender<Chunk>, Receiver<Chunk>) {
     crossbeam_channel::bounded(CHUNK_DEPTH)
 }
@@ -92,10 +92,6 @@ impl Read for ContentReader {
         Ok(n)
     }
 }
-
-// ---------------------------------------------------------------------------
-// PrefetchPool — parallel file reader that hands out ContentReaders in order
-// ---------------------------------------------------------------------------
 
 struct ReadJob {
     path: PathBuf,

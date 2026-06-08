@@ -28,7 +28,7 @@ pub const EOR: [u8; RECORD_LEN_SIZE + RECORD_TYPE_SIZE] = [0u8; RECORD_LEN_SIZE 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RecordType {
-    /// File content record
+    /// Snapshot entry record
     SnapshotEntry = 1,
     /// Diff change metadata
     DiffChange = 2,
