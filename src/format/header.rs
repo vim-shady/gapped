@@ -18,9 +18,6 @@ pub const RECORD_TYPE_SIZE: usize = 1;
 /// Combined record header: length field + type byte
 pub const RECORD_HEADER_SIZE: u64 = RECORD_LEN_SIZE as u64 + RECORD_TYPE_SIZE as u64;
 
-/// Length of XXH3-128 checksum in bytes
-pub const CHECKSUM_LEN: usize = 16;
-
 /// End-of-records marker (one zero-length record header)
 pub const EOR: [u8; RECORD_LEN_SIZE + RECORD_TYPE_SIZE] = [0u8; RECORD_LEN_SIZE + RECORD_TYPE_SIZE];
 

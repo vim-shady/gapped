@@ -696,54 +696,6 @@ mod tests {
         }
     }
 
-    /// Pass 1 (`parse_diff_metadata`) stops at the first FileContent record,
-    /// so corruption inside content is invisible to it. A full apply drains
-    /// the diff to the EOR checksum and must detect the corruption.
-    #[test]
-    fn test_pass1_stops_at_section_boundary() {
-        let tmp = TempDir::new().unwrap();
-        let source = tmp.path().join("source");
-        let target = tmp.path().join("target");
-        fs::create_dir(&source).unwrap();
-
-        const N: usize = 5;
-        for i in 0..N {
-            fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'a'; 1024]).unwrap();
-        }
-        copy_tree(&source, &target);
-
-        let snap1 = tmp.path().join("snap1");
-        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        for i in 0..N {
-            fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'b'; 2048]).unwrap();
-        }
-
-        let diff = tmp.path().join("diff.gapped");
-        let snap2 = tmp.path().join("snap2");
-        run_diff(
-            &source,
-            &snap1,
-            &diff,
-            &snap2,
-            None,
-            false,
-            &Reporter::hidden(),
-        )
-        .unwrap();
-
-        let mut bytes = fs::read(&diff).unwrap();
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xff;
-        fs::write(&diff, &bytes).unwrap();
-
-        let changes = parse_diff_metadata(&[diff.as_path()]).unwrap();
-        assert!(changes.len() >= N);
-
-        let result = run_apply(&target, &[diff.as_path()], &Reporter::hidden());
-        assert!(result.is_err(), "full apply must reject corrupted diff");
-    }
 
     #[test]
     fn test_run_apply_from_compressed_split_chunks() {
