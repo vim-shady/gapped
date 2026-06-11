@@ -697,6 +697,51 @@ mod tests {
     }
 
 
+    /// Regression test: a diff truncated mid-content (e.g. a half-finished
+    /// USB copy) must fail the apply *without* persisting the truncated
+    /// content over the existing target file.
+    #[test]
+    fn test_run_apply_truncated_diff_errors_and_preserves_target() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir(&source).unwrap();
+
+        fs::write(source.join("data.bin"), vec![b'a'; 4096]).unwrap();
+        copy_tree(&source, &target);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(source.join("data.bin"), vec![b'b'; 4096]).unwrap();
+
+        let diff = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(
+            &source,
+            &snap1,
+            &diff,
+            &snap2,
+            None,
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
+
+        // Chop off the tail: EOR (9 bytes) plus part of the content payload.
+        let full = fs::read(&diff).unwrap();
+        fs::write(&diff, &full[..full.len() - 100]).unwrap();
+
+        let result = run_apply(&target, &[diff.as_path()], &Reporter::hidden());
+        assert!(result.is_err(), "truncated diff must fail the apply");
+        assert_eq!(
+            fs::read(target.join("data.bin")).unwrap(),
+            vec![b'a'; 4096],
+            "target file must not be overwritten with truncated content"
+        );
+    }
+
     #[test]
     fn test_run_apply_from_compressed_split_chunks() {
         let tmp = TempDir::new().unwrap();
