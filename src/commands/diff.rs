@@ -132,6 +132,13 @@ fn compute_diff_merkle(old_entries: &[Entry], new_entries: &[Entry]) -> Result<D
                         && old.dir_hash.is_some()
                         && old.dir_hash == new.dir_hash
                     {
+                        // dir_hash covers only the children (a dir's own
+                        // metadata is hashed into its parent), so the
+                        // directory entry itself must still be compared.
+                        if let Some(change) = compute_entry_diff(old, new) {
+                            changes.push(change);
+                            modified += 1;
+                        }
                         let dir_path = &old.path;
                         skip_subtree(&mut old_iter, dir_path, old_entries);
                         skipped += skip_subtree(&mut new_iter, dir_path, new_entries);
@@ -853,6 +860,41 @@ mod tests {
         if let ChangeKind::Modified(ref m) = changes[0].kind {
             assert!(m.new_metadata.is_some());
             assert!(!m.has_content, "Directories never have content");
+        } else {
+            panic!("Expected Modified change");
+        }
+    }
+
+    /// Regression test: a directory whose own metadata changes but whose
+    /// contents are untouched has an unchanged dir_hash (dir_hash covers only
+    /// the children). The Merkle skip must not swallow the change.
+    #[test]
+    fn test_dir_metadata_only_change_survives_merkle_skip() {
+        let mut old = vec![
+            make_dir(Path::new("."), 1000),
+            make_dir(Path::new("sub"), 1000),
+            make_file(Path::new("sub/a.txt"), 100, 1000, Some(dummy_hash(1))),
+        ];
+        compute_dir_hashes(&mut old);
+
+        // chmod on sub/ only — children unchanged
+        let mut new = old.clone();
+        for e in &mut new {
+            e.dir_hash = None;
+        }
+        new[1].metadata.permissions = 0o700;
+        compute_dir_hashes(&mut new);
+        assert_eq!(
+            old[1].dir_hash, new[1].dir_hash,
+            "precondition: sub's dir_hash must be unchanged"
+        );
+
+        let changes = compute_diff(&old, &new).unwrap();
+
+        assert_eq!(changes.len(), 1, "the chmod on sub/ must produce a change");
+        assert_eq!(changes[0].path, RelativePath::new(Path::new("sub")).unwrap());
+        if let ChangeKind::Modified(ref m) = changes[0].kind {
+            assert_eq!(m.new_metadata.as_ref().unwrap().permissions, 0o700);
         } else {
             panic!("Expected Modified change");
         }

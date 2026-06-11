@@ -11,7 +11,7 @@ Offline file synchronizer for air-gapped systems.
 - **Hash caching** — unchanged files (same size + mtime) reuse their previous hash, skipping redundant reads
 - **Zstandard compression** — optional zstd compression for snapshots and diffs
 - **Split diffs** — large diffs can be split into size-limited chunks for transport on capacity-constrained media
-- **Integrity verification** — every file includes an XXH3-128 checksum; a dedicated `verify` command simulates apply without writing
+- **Verification** — a dedicated `verify` command simulates applying a diff and compares the result against the expected snapshot, without modifying the filesystem
 - **Full metadata preservation** — permissions, ownership (uid/gid), modification times, and symlink targets
 - **Merkle tree optimized calculation** - `diff` and `verify` commands use Merkle trees to shortcircuit calculation
 
@@ -73,7 +73,7 @@ Split the diff into chunks (useful when transporting on size-limited media):
 gapped diff /src/data snap.gapped diff.gapped snap_v2.gapped --split-size 4GB
 ```
 
-This produces `diff_001.gapped`, `diff_002.gapped`, etc. The `--split-size` flag accepts values like `100MB`, `500KB`, `2GB`, or a raw byte count.
+This produces `diff.gapped.001`, `diff.gapped.002`, etc. The `--split-size` flag accepts values like `100MB`, `500KB`, `2GB`, or a raw byte count.
 
 ### 3. Transfer
 
@@ -85,10 +85,10 @@ Copy the diff file(s) to the target machine using whatever physical medium is av
 gapped apply /target/data diff.gapped
 ```
 
-If the diff was split, pass any chunk — `gapped` auto-detects and applies all parts in order:
+If the diff was split, pass the base name — `gapped` auto-detects the chunks (`diff.gapped.001`, `diff.gapped.002`, …) and applies all parts in order:
 
 ```bash
-gapped apply /target/data diff_001.gapped
+gapped apply /target/data diff.gapped
 ```
 
 ### Verify before applying

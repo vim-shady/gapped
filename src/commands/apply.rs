@@ -696,29 +696,25 @@ mod tests {
         }
     }
 
-    /// Pass 1 (`parse_diff_metadata`) stops at the first FileContent record,
-    /// so corruption inside content is invisible to it. A full apply drains
-    /// the diff to the EOR checksum and must detect the corruption.
+
+    /// Regression test: a diff truncated mid-content (e.g. a half-finished
+    /// USB copy) must fail the apply *without* persisting the truncated
+    /// content over the existing target file.
     #[test]
-    fn test_pass1_stops_at_section_boundary() {
+    fn test_run_apply_truncated_diff_errors_and_preserves_target() {
         let tmp = TempDir::new().unwrap();
         let source = tmp.path().join("source");
         let target = tmp.path().join("target");
         fs::create_dir(&source).unwrap();
 
-        const N: usize = 5;
-        for i in 0..N {
-            fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'a'; 1024]).unwrap();
-        }
+        fs::write(source.join("data.bin"), vec![b'a'; 4096]).unwrap();
         copy_tree(&source, &target);
 
         let snap1 = tmp.path().join("snap1");
         run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        for i in 0..N {
-            fs::write(source.join(format!("f_{:02}.bin", i)), vec![b'b'; 2048]).unwrap();
-        }
+        fs::write(source.join("data.bin"), vec![b'b'; 4096]).unwrap();
 
         let diff = tmp.path().join("diff.gapped");
         let snap2 = tmp.path().join("snap2");
@@ -733,16 +729,17 @@ mod tests {
         )
         .unwrap();
 
-        let mut bytes = fs::read(&diff).unwrap();
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xff;
-        fs::write(&diff, &bytes).unwrap();
-
-        let changes = parse_diff_metadata(&[diff.as_path()]).unwrap();
-        assert!(changes.len() >= N);
+        // Chop off the tail: EOR (9 bytes) plus part of the content payload.
+        let full = fs::read(&diff).unwrap();
+        fs::write(&diff, &full[..full.len() - 100]).unwrap();
 
         let result = run_apply(&target, &[diff.as_path()], &Reporter::hidden());
-        assert!(result.is_err(), "full apply must reject corrupted diff");
+        assert!(result.is_err(), "truncated diff must fail the apply");
+        assert_eq!(
+            fs::read(target.join("data.bin")).unwrap(),
+            vec![b'a'; 4096],
+            "target file must not be overwritten with truncated content"
+        );
     }
 
     #[test]

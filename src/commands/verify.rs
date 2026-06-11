@@ -111,6 +111,10 @@ fn compare_with_merkle(
                         && sim.dir_hash == tgt.dir_hash
                         && !implicit_dirs.contains(&sim.path)
                     {
+                        // dir_hash covers only the children (a dir's own
+                        // metadata is hashed into its parent), so the
+                        // directory entry itself must still be compared.
+                        compare_single_entry(sim, tgt, implicit_dirs, &mut discrepancies);
                         let dir_path = sim.path.clone();
                         skip_subtree(&mut sim_iter, &dir_path, simulated);
                         skip_subtree(&mut tgt_iter, &dir_path, target);
@@ -300,6 +304,53 @@ mod tests {
 
         run_verify(&target, &[diff.as_path()], &snap2, &Reporter::hidden())
             .expect("verify must ignore drift on dirs apply will not touch");
+    }
+
+    /// Regression test: drift on a directory's *own* metadata is invisible to
+    /// that directory's dir_hash (it covers only the children), so the Merkle
+    /// skip used to swallow the mismatch. Verify must report it.
+    #[test]
+    fn test_run_verify_detects_dir_metadata_drift_under_merkle_skip() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+
+        // sub/ stays untouched by the diff so its dir_hash matches on both sides.
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("sub/inner.txt"), b"static").unwrap();
+        fs::write(source.join("a.txt"), b"v1").unwrap();
+        copy_tree(&source, &target);
+
+        let snap1 = tmp.path().join("snap1");
+        run_snapshot(&source, &snap1, None, false, &Reporter::hidden()).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(source.join("a.txt"), b"v2-longer").unwrap();
+
+        let diff = tmp.path().join("diff.gapped");
+        let snap2 = tmp.path().join("snap2");
+        run_diff(
+            &source,
+            &snap1,
+            &diff,
+            &snap2,
+            None,
+            false,
+            &Reporter::hidden(),
+        )
+        .unwrap();
+
+        // Drift the target: chmod sub/. Its contents (and thus dir_hash) are
+        // unchanged, so only the entry's own metadata disagrees with snap2.
+        fs::set_permissions(target.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = run_verify(&target, &[diff.as_path()], &snap2, &Reporter::hidden());
+        assert!(
+            result.is_err(),
+            "verify must detect permission drift on a dir with unchanged contents"
+        );
     }
 
     #[test]

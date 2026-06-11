@@ -1,12 +1,8 @@
 use crate::error::{GappedError, Result};
 use crate::format::header::{
-    CHECKSUM_LEN, FileHeader, MAGIC, MAGIC_COMPRESSED, MAGIC_LEN, RECORD_LEN_SIZE,
-    RECORD_TYPE_SIZE, RecordType,
+    FileHeader, MAGIC, MAGIC_COMPRESSED, MAGIC_LEN, RECORD_LEN_SIZE, RECORD_TYPE_SIZE, RecordType,
 };
 use std::io::{BufReader, Read, Write};
-use xxhash_rust::xxh3::Xxh3;
-
-const STREAM_BUF: usize = 64 * 1024;
 
 pub struct RecordHeader {
     pub record_type: RecordType,
@@ -15,17 +11,13 @@ pub struct RecordHeader {
 
 pub struct FormatReader {
     inner: Box<dyn Read>,
-    hasher: Xxh3,
     finished: bool,
 }
 
 impl FormatReader {
     pub fn new<R: Read + 'static>(mut inner: R) -> Result<(Self, FileHeader)> {
-        let mut hasher = Xxh3::new();
-
         let mut magic = [0u8; MAGIC_LEN];
         inner.read_exact(&mut magic)?;
-        hasher.update(&magic);
 
         let compressed = if &magic == MAGIC {
             false
@@ -46,28 +38,19 @@ impl FormatReader {
 
         let mut len_bytes = [0u8; 4];
         reader.read_exact(&mut len_bytes)?;
-        hasher.update(&len_bytes);
 
         let mut header_bytes = vec![0u8; u32::from_le_bytes(len_bytes) as usize];
         reader.read_exact(&mut header_bytes)?;
-        hasher.update(&header_bytes);
 
         let header: FileHeader = rmp_serde::from_slice(&header_bytes)?;
 
         Ok((
             FormatReader {
                 inner: reader,
-                hasher,
                 finished: false,
             },
             header,
         ))
-    }
-
-    fn hashed_read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.inner.read_exact(buf)?;
-        self.hasher.update(buf);
-        Ok(())
     }
 
     /// Read the next record header. Returns `None` at EOR.
@@ -80,20 +63,10 @@ impl FormatReader {
 
         let mut len_bytes = [0u8; RECORD_LEN_SIZE];
         let mut type_byte = [0u8; RECORD_TYPE_SIZE];
-        self.hashed_read_exact(&mut len_bytes)?;
-        self.hashed_read_exact(&mut type_byte)?;
+        self.inner.read_exact(&mut len_bytes)?;
+        self.inner.read_exact(&mut type_byte)?;
 
         if len_bytes == [0u8; RECORD_LEN_SIZE] && type_byte[0] == 0 {
-            let mut checksum_bytes = [0u8; CHECKSUM_LEN];
-            self.inner.read_exact(&mut checksum_bytes)?;
-
-            let expected_hash = self.hasher.digest128().to_le_bytes();
-            if expected_hash != checksum_bytes {
-                return Err(GappedError::ChecksumMismatch {
-                    expected: hex_encode(&expected_hash),
-                    got: hex_encode(&checksum_bytes),
-                });
-            }
             self.finished = true;
             return Ok(None);
         }
@@ -110,7 +83,7 @@ impl FormatReader {
 
     pub fn read_payload(&mut self, len: u64) -> Result<Vec<u8>> {
         let mut payload = vec![0u8; len as usize];
-        self.hashed_read_exact(&mut payload)?;
+        self.inner.read_exact(&mut payload)?;
         Ok(payload)
     }
 
@@ -119,18 +92,14 @@ impl FormatReader {
     }
 
     pub fn copy_payload_to<W: Write>(&mut self, len: u64, dest: &mut W) -> Result<()> {
-        let mut buf = [0u8; STREAM_BUF];
-        let mut remaining = len;
-        while remaining > 0 {
-            let to_read = (remaining as usize).min(buf.len());
-            self.hashed_read_exact(&mut buf[..to_read])?;
-            dest.write_all(&buf[..to_read])?;
-            remaining -= to_read as u64;
+        let mut limited = (&mut self.inner).take(len);
+        let copied = std::io::copy(&mut limited, dest)?;
+        if copied != len {
+            return Err(GappedError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("record payload short by {} bytes", len - copied),
+            )));
         }
         Ok(())
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

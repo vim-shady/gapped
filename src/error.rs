@@ -21,9 +21,6 @@ pub enum GappedError {
     #[error("Invalid format: {0}")]
     InvalidFormat(String),
 
-    #[error("Checksum mismatch: expected {expected}, got {got}")]
-    ChecksumMismatch { expected: String, got: String },
-
     #[error("Path is not relative or contains invalid components: {0}")]
     InvalidPath(PathBuf),
 
