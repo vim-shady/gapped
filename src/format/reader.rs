@@ -93,7 +93,13 @@ impl FormatReader {
 
     pub fn copy_payload_to<W: Write>(&mut self, len: u64, dest: &mut W) -> Result<()> {
         let mut limited = (&mut self.inner).take(len);
-        std::io::copy(&mut limited, dest)?;
+        let copied = std::io::copy(&mut limited, dest)?;
+        if copied != len {
+            return Err(GappedError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("record payload short by {} bytes", len - copied),
+            )));
+        }
         Ok(())
     }
 }
